@@ -81,6 +81,51 @@ class MainTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json().get("error_code"), "run_not_queued")
 
+    def test_claim_next_run_uses_rpc_contract(self) -> None:
+        row = {"id": str(uuid4()), "status": "extracting", "user_id": "user-123", "resume_path": "user-123/resume.pdf"}
+        with patch.object(main, "_supabase_fetch", AsyncMock(return_value=[row])) as fetch_mock:
+            claimed = asyncio.run(main._claim_next_run())
+
+        self.assertEqual(claimed, row)
+        fetch_mock.assert_awaited_once_with(path="rpc/claim_next_resume_run", method="POST", body={})
+
+    def test_claim_next_run_returns_none_when_no_queued_rows(self) -> None:
+        with patch.object(main, "_supabase_fetch", AsyncMock(return_value=[])):
+            claimed = asyncio.run(main._claim_next_run())
+        self.assertIsNone(claimed)
+
+    def test_claim_next_run_rejects_invalid_rpc_payload(self) -> None:
+        with patch.object(main, "_supabase_fetch", AsyncMock(return_value={"id": "not-a-list"})):
+            with self.assertRaises(main.HttpError) as exc:
+                asyncio.run(main._claim_next_run())
+        self.assertEqual(exc.exception.code, main.ERR_INVALID_RUN_ROW)
+
+    def test_run_worker_once_noop_when_no_claim(self) -> None:
+        with patch.object(main, "_claim_next_run", AsyncMock(return_value=None)):
+            processed = asyncio.run(main._run_worker_once())
+        self.assertFalse(processed)
+
+    def test_run_worker_once_processes_claimed_row(self) -> None:
+        run_id = uuid4()
+        with (
+            patch.object(
+                main,
+                "_claim_next_run",
+                AsyncMock(return_value={"id": str(run_id), "user_id": "user-123", "resume_path": "user-123/resume.pdf"}),
+            ),
+            patch.object(main, "_process_claimed_run", AsyncMock()) as process_mock,
+        ):
+            processed = asyncio.run(main._run_worker_once())
+
+        self.assertTrue(processed)
+        process_mock.assert_awaited_once_with(run_id, "user-123", "user-123/resume.pdf")
+
+    def test_run_worker_once_rejects_invalid_claimed_row(self) -> None:
+        with patch.object(main, "_claim_next_run", AsyncMock(return_value={"id": "abc"})):
+            with self.assertRaises(main.HttpError) as exc:
+                asyncio.run(main._run_worker_once())
+        self.assertEqual(exc.exception.code, main.ERR_INVALID_RUN_ROW)
+
     def test_extract_marks_failed_on_exception(self) -> None:
         run_id = uuid4()
         set_failed_mock = AsyncMock()
@@ -217,6 +262,42 @@ class MainTests(unittest.TestCase):
             with self.assertRaises(main.HttpError) as exc:
                 asyncio.run(main._download_resume_bytes("user-123/resume.pdf"))
         self.assertEqual(exc.exception.code, main.ERR_DOWNLOAD_FAILED)
+
+    def test_build_realtime_websocket_url_uses_ws_scheme_and_path(self) -> None:
+        with (
+            patch.object(main, "SUPABASE_URL", "https://example.supabase.co"),
+            patch.object(main, "SUPABASE_SERVICE_ROLE_KEY", "service-role-key"),
+            patch.object(main, "SUPABASE_STORAGE_BUCKET", "Resumes"),
+        ):
+            url = main._build_realtime_websocket_url()
+        self.assertEqual(
+            url,
+            "wss://example.supabase.co/realtime/v1/websocket?apikey=service-role-key&vsn=1.0.0",
+        )
+
+    def test_is_resume_runs_queued_change_true_for_queued_record(self) -> None:
+        message = {
+            "event": "postgres_changes",
+            "payload": {
+                "table": "resume_runs",
+                "data": {
+                    "record": {"status": "queued"},
+                },
+            },
+        }
+        self.assertTrue(main._is_resume_runs_queued_change(message))
+
+    def test_is_resume_runs_queued_change_false_for_non_queued_record(self) -> None:
+        message = {
+            "event": "postgres_changes",
+            "payload": {
+                "table": "resume_runs",
+                "data": {
+                    "record": {"status": "extracting"},
+                },
+            },
+        }
+        self.assertFalse(main._is_resume_runs_queued_change(message))
 
 
 if __name__ == "__main__":

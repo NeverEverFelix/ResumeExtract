@@ -1,0 +1,23 @@
+[Unit]
+Description=Resume Extract Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=resume
+Group=resume
+WorkingDirectory=/opt/resume-extract
+EnvironmentFile=/etc/resume-extract/worker.env
+ExecStart=/opt/resume-extract/.venv/bin/python -m src.worker
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/resume-extract
+
+[Install]
+WantedBy=multi-user.target

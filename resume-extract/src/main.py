@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -5,13 +6,15 @@ import re
 import shutil
 import time
 from collections import Counter
+from contextlib import asynccontextmanager, suppress
 from hmac import compare_digest
 from io import BytesIO
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlparse, urlunparse
 from uuid import UUID
 
 import httpx
+import websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
@@ -28,6 +31,11 @@ SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET")
 EXTRACT_AUTH_TOKEN = os.getenv("EXTRACT_AUTH_TOKEN")
 EXTRACT_DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("EXTRACT_DOWNLOAD_TIMEOUT_SECONDS", "60"))
 MAX_RESUME_FILE_SIZE_MB = int(os.getenv("MAX_RESUME_FILE_SIZE_MB", "15"))
+WORKER_POLL_INTERVAL_SECONDS = float(os.getenv("WORKER_POLL_INTERVAL_SECONDS", "2"))
+WORKER_REALTIME_ENABLED = os.getenv("WORKER_REALTIME_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+WORKER_REALTIME_HEARTBEAT_SECONDS = float(os.getenv("WORKER_REALTIME_HEARTBEAT_SECONDS", "25"))
+WORKER_REALTIME_RECONNECT_SECONDS = float(os.getenv("WORKER_REALTIME_RECONNECT_SECONDS", "5"))
+WORKER_ATTACH_TO_API = os.getenv("WORKER_ATTACH_TO_API", "false").lower() in {"1", "true", "yes", "on"}
 
 MAX_RESUME_FILE_SIZE_BYTES = MAX_RESUME_FILE_SIZE_MB * 1024 * 1024
 ALLOWED_BINARY_CONTENT_TYPES = {"application/octet-stream", "binary/octet-stream"}
@@ -42,7 +50,22 @@ ALLOWED_DOCX_CONTENT_TYPES = {
     *ALLOWED_BINARY_CONTENT_TYPES,
 }
 
-app = FastAPI()
+@asynccontextmanager
+async def _app_lifespan(_: FastAPI):
+    worker_task: asyncio.Task[None] | None = None
+    if WORKER_ATTACH_TO_API:
+        _log_event(phase="api_start_worker_attached")
+        worker_task = asyncio.create_task(run_worker_forever())
+    try:
+        yield
+    finally:
+        if worker_task:
+            worker_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker_task
+
+
+app = FastAPI(lifespan=_app_lifespan)
 logger = logging.getLogger("resume_extract_service")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
@@ -218,6 +241,25 @@ async def _claim_run(run_id: UUID) -> dict[str, Any]:
             code=ERR_RUN_NOT_QUEUED,
             message="Run is not in queued state or does not exist",
         )
+    return rows[0]
+
+
+async def _claim_next_run() -> dict[str, Any] | None:
+    rows = await _supabase_fetch(
+        path="rpc/claim_next_resume_run",
+        method="POST",
+        body={},
+    )
+    if rows is None:
+        return None
+    if not isinstance(rows, list):
+        raise HttpError(
+            status=500,
+            code=ERR_INVALID_RUN_ROW,
+            message="Claim-next RPC returned invalid payload",
+        )
+    if len(rows) == 0:
+        return None
     return rows[0]
 
 
@@ -492,51 +534,9 @@ async def _perform_extraction(resume_path: str) -> tuple[str, dict[str, Any]]:
     )
 
 
-@app.exception_handler(HttpError)
-async def http_error_handler(_, exc: HttpError) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status,
-        content={
-            "ok": False,
-            "error_code": exc.code,
-            "error_message": exc.message,
-        },
-    )
-
-
-@app.get("/health")
-async def health() -> dict[str, bool]:
-    return {"ok": True}
-
-
-@app.post("/extract")
-async def extract(
-    payload: ExtractRequest,
-    x_extract_token: str | None = Header(default=None, alias="X-Extract-Token"),
-) -> dict[str, Any]:
-    _assert_extract_auth(x_extract_token)
-    run_id = payload.run_id
+async def _process_claimed_run(run_id: UUID, run_user_id: str, run_resume_path: str) -> None:
     parser_name: str | None = None
     request_start = time.perf_counter()
-    _log_event(phase="extract_start", run_id=run_id)
-
-    claim_start = time.perf_counter()
-    run_row = await _claim_run(run_id)
-    _log_event(
-        phase="claim_complete",
-        run_id=run_id,
-        duration_ms=int((time.perf_counter() - claim_start) * 1000),
-    )
-
-    run_user_id = run_row.get("user_id")
-    run_resume_path = run_row.get("resume_path")
-    if not isinstance(run_user_id, str) or not isinstance(run_resume_path, str):
-        raise HttpError(
-            status=500,
-            code=ERR_INVALID_RUN_ROW,
-            message="Claimed run is missing user_id or resume_path",
-        )
-
     try:
         extraction_start = time.perf_counter()
         extracted_text, metadata = await _perform_extraction(run_resume_path)
@@ -572,7 +572,6 @@ async def extract(
             parser=parser_name,
             duration_ms=int((time.perf_counter() - request_start) * 1000),
         )
-        return {"ok": True, "run_id": str(run_id), "status": "extracted"}
     except Exception as error:  # pragma: no cover
         error_code = error.code if isinstance(error, HttpError) else ERR_PARSE_ERROR
         error_message = str(error) if str(error) else "Unknown extraction failure"
@@ -601,7 +600,227 @@ async def extract(
                 parser=parser_name,
                 error_code=error_code,
             )
-            pass
         if isinstance(error, HttpError):
             raise error
         raise HttpError(status=500, code=error_code, message=error_message)
+
+
+async def _run_worker_once() -> bool:
+    claimed = await _claim_next_run()
+    if claimed is None:
+        return False
+
+    run_id_raw = claimed.get("id")
+    run_user_id_raw = claimed.get("user_id")
+    run_resume_path = claimed.get("resume_path")
+
+    if not isinstance(run_id_raw, str) or not isinstance(run_user_id_raw, str) or not isinstance(run_resume_path, str):
+        raise HttpError(
+            status=500,
+            code=ERR_INVALID_RUN_ROW,
+            message="Claim-next row is missing id, user_id, or resume_path",
+        )
+
+    run_id = UUID(run_id_raw)
+    _log_event(phase="worker_claimed", run_id=run_id)
+    try:
+        await _process_claimed_run(run_id, run_user_id_raw, run_resume_path)
+    except HttpError:
+        # Failure details and run status are handled in _process_claimed_run.
+        pass
+    return True
+
+
+async def run_worker_forever() -> None:
+    wake_event = asyncio.Event()
+    realtime_task: asyncio.Task[None] | None = None
+    if WORKER_REALTIME_ENABLED:
+        realtime_task = asyncio.create_task(_run_realtime_wakeup_loop(wake_event))
+
+    _log_event(
+        phase="worker_start",
+        poll_interval_seconds=WORKER_POLL_INTERVAL_SECONDS,
+        realtime_enabled=WORKER_REALTIME_ENABLED,
+    )
+    try:
+        while True:
+            try:
+                processed_any = False
+                while True:
+                    processed = await _run_worker_once()
+                    if not processed:
+                        break
+                    processed_any = True
+
+                if processed_any:
+                    continue
+
+                try:
+                    await asyncio.wait_for(wake_event.wait(), timeout=WORKER_POLL_INTERVAL_SECONDS)
+                    wake_event.clear()
+                except asyncio.TimeoutError:
+                    pass
+            except HttpError as error:
+                _log_event(phase="worker_error", error_code=error.code, error_message=error.message)
+                await asyncio.sleep(WORKER_POLL_INTERVAL_SECONDS)
+            except Exception as error:  # pragma: no cover
+                _log_event(phase="worker_error", error_code=ERR_PARSE_ERROR, error_message=str(error))
+                await asyncio.sleep(WORKER_POLL_INTERVAL_SECONDS)
+    finally:
+        if realtime_task:
+            realtime_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await realtime_task
+
+
+def _build_realtime_websocket_url() -> str:
+    _assert_config()
+    assert SUPABASE_URL is not None
+    assert SUPABASE_SERVICE_ROLE_KEY is not None
+
+    parsed = urlparse(SUPABASE_URL)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    query = urlencode({"apikey": SUPABASE_SERVICE_ROLE_KEY, "vsn": "1.0.0"})
+    return urlunparse((scheme, parsed.netloc, "/realtime/v1/websocket", "", query, ""))
+
+
+def _is_resume_runs_queued_change(message: dict[str, Any]) -> bool:
+    if message.get("event") != "postgres_changes":
+        return False
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    table = payload.get("table")
+    if table != "resume_runs":
+        return False
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return False
+    record = data.get("record")
+    if not isinstance(record, dict):
+        return False
+    return record.get("status") == "queued"
+
+
+async def _run_realtime_wakeup_loop(wake_event: asyncio.Event) -> None:
+    while True:
+        try:
+            await _run_realtime_session(wake_event)
+        except Exception as error:  # pragma: no cover
+            _log_event(
+                phase="worker_realtime_error",
+                error_code=ERR_DOWNLOAD_FAILED,
+                error_message=str(error),
+            )
+            wake_event.set()
+            await asyncio.sleep(WORKER_REALTIME_RECONNECT_SECONDS)
+
+
+async def _run_realtime_session(wake_event: asyncio.Event) -> None:
+    channel_topic = f"realtime:{SUPABASE_DB_SCHEMA}:resume_runs"
+    join_payload = {
+        "topic": channel_topic,
+        "event": "phx_join",
+        "payload": {
+            "config": {
+                "broadcast": {"ack": False, "self": False},
+                "presence": {"key": ""},
+                "postgres_changes": [
+                    {
+                        "event": "INSERT",
+                        "schema": SUPABASE_DB_SCHEMA,
+                        "table": "resume_runs",
+                        "filter": "status=eq.queued",
+                    },
+                    {
+                        "event": "UPDATE",
+                        "schema": SUPABASE_DB_SCHEMA,
+                        "table": "resume_runs",
+                        "filter": "status=eq.queued",
+                    },
+                ],
+            },
+            "access_token": SUPABASE_SERVICE_ROLE_KEY,
+        },
+        "ref": "1",
+    }
+    heartbeat_ref = 1
+    _log_event(phase="worker_realtime_connecting")
+
+    async with websockets.connect(_build_realtime_websocket_url()) as websocket:
+        await websocket.send(json.dumps(join_payload))
+        _log_event(phase="worker_realtime_connected")
+
+        async def heartbeat_loop() -> None:
+            nonlocal heartbeat_ref
+            while True:
+                await asyncio.sleep(WORKER_REALTIME_HEARTBEAT_SECONDS)
+                heartbeat_ref += 1
+                heartbeat = {
+                    "topic": "phoenix",
+                    "event": "heartbeat",
+                    "payload": {},
+                    "ref": str(heartbeat_ref),
+                }
+                await websocket.send(json.dumps(heartbeat))
+
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
+        try:
+            while True:
+                raw = await websocket.recv()
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if _is_resume_runs_queued_change(message):
+                    _log_event(phase="worker_realtime_wakeup")
+                    wake_event.set()
+        finally:
+            heartbeat_task.cancel()
+
+
+@app.exception_handler(HttpError)
+async def http_error_handler(_, exc: HttpError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status,
+        content={
+            "ok": False,
+            "error_code": exc.code,
+            "error_message": exc.message,
+        },
+    )
+
+
+@app.get("/health")
+async def health() -> dict[str, bool]:
+    return {"ok": True}
+
+
+@app.post("/extract")
+async def extract(
+    payload: ExtractRequest,
+    x_extract_token: str | None = Header(default=None, alias="X-Extract-Token"),
+) -> dict[str, Any]:
+    _assert_extract_auth(x_extract_token)
+    run_id = payload.run_id
+    _log_event(phase="extract_start", run_id=run_id)
+
+    claim_start = time.perf_counter()
+    run_row = await _claim_run(run_id)
+    _log_event(
+        phase="claim_complete",
+        run_id=run_id,
+        duration_ms=int((time.perf_counter() - claim_start) * 1000),
+    )
+
+    run_user_id = run_row.get("user_id")
+    run_resume_path = run_row.get("resume_path")
+    if not isinstance(run_user_id, str) or not isinstance(run_resume_path, str):
+        raise HttpError(
+            status=500,
+            code=ERR_INVALID_RUN_ROW,
+            message="Claimed run is missing user_id or resume_path",
+        )
+
+    await _process_claimed_run(run_id, run_user_id, run_resume_path)
+    return {"ok": True, "run_id": str(run_id), "status": "extracted"}

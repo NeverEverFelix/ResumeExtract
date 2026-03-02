@@ -24,6 +24,54 @@ brew install tesseract poppler
 uvicorn src.main:app --host 0.0.0.0 --port 3000 --reload
 ```
 
+Attach worker to the API server process:
+
+```bash
+WORKER_ATTACH_TO_API=true uvicorn src.main:app --host 0.0.0.0 --port 3000
+```
+
+## Run Worker
+
+Run the long-lived worker process (Realtime wakeup + polling fallback):
+
+```bash
+python -m src.worker
+```
+
+Worker env variables:
+- `WORKER_POLL_INTERVAL_SECONDS` (optional, default `2`)
+- `WORKER_REALTIME_ENABLED` (optional, default `true`)
+- `WORKER_REALTIME_HEARTBEAT_SECONDS` (optional, default `25`)
+- `WORKER_REALTIME_RECONNECT_SECONDS` (optional, default `5`)
+- `WORKER_ATTACH_TO_API` (optional, default `false`; when `true`, worker starts inside API process)
+
+## Deploy Worker (systemd)
+
+Template unit file:
+- `deploy/systemd/resume-extract-worker.service`
+
+Example production setup (Linux):
+
+```bash
+sudo cp deploy/systemd/resume-extract-worker.service /etc/systemd/system/
+sudo mkdir -p /etc/resume-extract
+sudo cp .env /etc/resume-extract/worker.env
+sudo systemctl daemon-reload
+sudo systemctl enable --now resume-extract-worker
+sudo systemctl status resume-extract-worker
+```
+
+View logs:
+
+```bash
+journalctl -u resume-extract-worker -f
+```
+
+Important:
+- The worker uses service-role credentials and atomically claims queued runs in Postgres (`claim_next_resume_run()`), so multiple workers can run safely without double-processing.
+- Update `User`, `Group`, `WorkingDirectory`, and `ExecStart` in the unit file for your server paths.
+- If `WORKER_ATTACH_TO_API=true`, each API process will run a worker. Keep API process count in mind for desired worker concurrency.
+
 ## Test
 
 ```bash
