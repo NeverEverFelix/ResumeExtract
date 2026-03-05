@@ -128,6 +128,28 @@ class ExtractRequest(BaseModel):
     run_id: UUID
 
 
+def _capture_exception(
+    error: Exception,
+    *,
+    phase: str,
+    run_id: UUID | None = None,
+    parser: str | None = None,
+) -> None:
+    # Keep Sentry signal clean: report only unexpected errors and server-side HttpErrors.
+    if isinstance(error, HttpError) and error.status < 500:
+        return
+    with sentry_sdk.push_scope() as scope:
+        scope.set_tag("phase", phase)
+        if isinstance(error, HttpError):
+            scope.set_tag("error_code", error.code)
+            scope.set_extra("http_status", error.status)
+        if run_id is not None:
+            scope.set_tag("run_id", str(run_id))
+        if parser:
+            scope.set_tag("parser", parser)
+        sentry_sdk.capture_exception(error)
+
+
 def _log_event(
     phase: str,
     run_id: UUID | None = None,
@@ -594,6 +616,7 @@ async def _process_claimed_run(run_id: UUID, run_user_id: str, run_resume_path: 
             duration_ms=int((time.perf_counter() - request_start) * 1000),
         )
     except Exception as error:  # pragma: no cover
+        _capture_exception(error, phase="process_claimed_run", run_id=run_id, parser=parser_name)
         error_code = error.code if isinstance(error, HttpError) else ERR_PARSE_ERROR
         error_message = str(error) if str(error) else "Unknown extraction failure"
         _log_event(
@@ -683,9 +706,11 @@ async def run_worker_forever() -> None:
                     pass
             except HttpError as error:
                 _log_event(phase="worker_error", error_code=error.code, error_message=error.message)
+                _capture_exception(error, phase="worker_loop")
                 await asyncio.sleep(WORKER_POLL_INTERVAL_SECONDS)
             except Exception as error:  # pragma: no cover
                 _log_event(phase="worker_error", error_code=ERR_PARSE_ERROR, error_message=str(error))
+                _capture_exception(error, phase="worker_loop")
                 await asyncio.sleep(WORKER_POLL_INTERVAL_SECONDS)
     finally:
         if realtime_task:
@@ -733,6 +758,7 @@ async def _run_realtime_wakeup_loop(wake_event: asyncio.Event) -> None:
                 error_code=ERR_DOWNLOAD_FAILED,
                 error_message=str(error),
             )
+            _capture_exception(error, phase="worker_realtime")
             wake_event.set()
             await asyncio.sleep(WORKER_REALTIME_RECONNECT_SECONDS)
 
