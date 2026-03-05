@@ -14,6 +14,7 @@ from urllib.parse import quote, urlencode, urlparse, urlunparse
 from uuid import UUID
 
 import httpx
+import sentry_sdk
 import websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header
@@ -21,8 +22,28 @@ from fastapi.responses import JSONResponse
 from pypdf import PdfReader
 from pydantic import BaseModel
 from docx import Document
+from sentry_sdk.integrations.fastapi import FastApiIntegration
 
 load_dotenv()
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        environment=os.getenv("SENTRY_ENVIRONMENT"),
+        release=os.getenv("SENTRY_RELEASE"),
+        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0")),
+        profiles_sample_rate=float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0")),
+        send_default_pii=_env_flag("SENTRY_SEND_DEFAULT_PII", default=False),
+        integrations=[FastApiIntegration()],
+    )
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -32,10 +53,10 @@ EXTRACT_AUTH_TOKEN = os.getenv("EXTRACT_AUTH_TOKEN")
 EXTRACT_DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("EXTRACT_DOWNLOAD_TIMEOUT_SECONDS", "60"))
 MAX_RESUME_FILE_SIZE_MB = int(os.getenv("MAX_RESUME_FILE_SIZE_MB", "15"))
 WORKER_POLL_INTERVAL_SECONDS = float(os.getenv("WORKER_POLL_INTERVAL_SECONDS", "2"))
-WORKER_REALTIME_ENABLED = os.getenv("WORKER_REALTIME_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+WORKER_REALTIME_ENABLED = _env_flag("WORKER_REALTIME_ENABLED", default=True)
 WORKER_REALTIME_HEARTBEAT_SECONDS = float(os.getenv("WORKER_REALTIME_HEARTBEAT_SECONDS", "25"))
 WORKER_REALTIME_RECONNECT_SECONDS = float(os.getenv("WORKER_REALTIME_RECONNECT_SECONDS", "5"))
-WORKER_ATTACH_TO_API = os.getenv("WORKER_ATTACH_TO_API", "false").lower() in {"1", "true", "yes", "on"}
+WORKER_ATTACH_TO_API = _env_flag("WORKER_ATTACH_TO_API", default=False)
 
 MAX_RESUME_FILE_SIZE_BYTES = MAX_RESUME_FILE_SIZE_MB * 1024 * 1024
 ALLOWED_BINARY_CONTENT_TYPES = {"application/octet-stream", "binary/octet-stream"}

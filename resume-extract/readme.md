@@ -86,6 +86,12 @@ Required environment variables:
 - `SUPABASE_DB_SCHEMA` (optional, default `public`)
 - `MAX_RESUME_FILE_SIZE_MB` (optional, default `15`)
 - `EXTRACT_DOWNLOAD_TIMEOUT_SECONDS` (optional, default `60`)
+- `SENTRY_DSN` (optional; when set, Sentry is initialized at process startup for API + worker)
+- `SENTRY_ENVIRONMENT` (optional)
+- `SENTRY_RELEASE` (optional)
+- `SENTRY_TRACES_SAMPLE_RATE` (optional, default `0`)
+- `SENTRY_PROFILES_SAMPLE_RATE` (optional, default `0`)
+- `SENTRY_SEND_DEFAULT_PII` (optional, default `false`)
 
 `.env` is auto-loaded via `python-dotenv`.
 
