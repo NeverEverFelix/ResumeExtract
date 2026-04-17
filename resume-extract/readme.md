@@ -78,6 +78,27 @@ Important:
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
+## CI/CD
+
+GitHub Actions workflows live in:
+- `.github/workflows/ci.yml`
+- `.github/workflows/cd.yml`
+
+CI behavior:
+- Runs on pull requests and pushes to `main`
+- Installs Python dependencies
+- Runs the unit test suite
+- Verifies the Docker image builds
+
+CD behavior:
+- Runs on pushes to `main` and manual dispatch
+- Builds the production Docker image from `resume-extract/Dockerfile`
+- Publishes the image to `ghcr.io/<owner>/resume-extract`
+
+Published image tags:
+- `latest` on the default branch
+- `sha-<commit>`
+
 Required environment variables:
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
