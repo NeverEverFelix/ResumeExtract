@@ -678,6 +678,8 @@ async def _run_worker_once() -> bool:
 async def run_worker_forever() -> None:
     wake_event = asyncio.Event()
     realtime_task: asyncio.Task[None] | None = None
+    idle_cycles = 0
+    idle_log_every_cycles = max(1, int(60 / max(WORKER_POLL_INTERVAL_SECONDS, 0.1)))
     if WORKER_REALTIME_ENABLED:
         realtime_task = asyncio.create_task(_run_realtime_wakeup_loop(wake_event))
 
@@ -697,7 +699,16 @@ async def run_worker_forever() -> None:
                     processed_any = True
 
                 if processed_any:
+                    idle_cycles = 0
                     continue
+
+                idle_cycles += 1
+                if idle_cycles % idle_log_every_cycles == 0:
+                    _log_event(
+                        phase="worker_idle",
+                        idle_cycles=idle_cycles,
+                        idle_seconds=int(idle_cycles * WORKER_POLL_INTERVAL_SECONDS),
+                    )
 
                 try:
                     await asyncio.wait_for(wake_event.wait(), timeout=WORKER_POLL_INTERVAL_SECONDS)

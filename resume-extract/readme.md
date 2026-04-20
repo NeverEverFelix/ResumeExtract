@@ -45,6 +45,10 @@ Worker env variables:
 - `WORKER_REALTIME_RECONNECT_SECONDS` (optional, default `5`)
 - `WORKER_ATTACH_TO_API` (optional, default `false`; when `true`, worker starts inside API process)
 
+Render note:
+- The provided Docker image sets `WORKER_ATTACH_TO_API=true`, so a single Render web service runs both the API and the extraction worker by default.
+- If you split API and worker into separate services, override `WORKER_ATTACH_TO_API=false` on the web service and run `python -m src.worker` in the worker service.
+
 ## Deploy Worker (systemd)
 
 Template unit file:
