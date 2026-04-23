@@ -141,6 +141,10 @@ class ExtractRequest(BaseModel):
     run_id: UUID
 
 
+def _is_supabase_opaque_key(value: str) -> bool:
+    return value.startswith("sb_secret_") or value.startswith("sb_publishable_")
+
+
 def _capture_exception(
     error: Exception,
     *,
@@ -208,6 +212,28 @@ def _assert_config() -> None:
         )
 
 
+def _supabase_headers(
+    *,
+    content_type: str | None = None,
+    prefer: str | None = None,
+    include_profiles: bool = False,
+) -> dict[str, str]:
+    _assert_config()
+    assert SUPABASE_SERVICE_ROLE_KEY is not None
+
+    headers = {"apikey": SUPABASE_SERVICE_ROLE_KEY}
+    if not _is_supabase_opaque_key(SUPABASE_SERVICE_ROLE_KEY):
+        headers["Authorization"] = f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"
+    if content_type:
+        headers["Content-Type"] = content_type
+    if include_profiles:
+        headers["Accept-Profile"] = SUPABASE_DB_SCHEMA
+        headers["Content-Profile"] = SUPABASE_DB_SCHEMA
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
 def _validate_content_type(resume_path: str, content_type_header: str | None) -> None:
     if not content_type_header:
         return
@@ -253,16 +279,7 @@ def _validate_file_size(content_length_header: str | None, file_bytes_len: int) 
 
 async def _supabase_fetch(path: str, method: str, body: dict[str, Any] | None = None, prefer: str | None = None) -> Any:
     _assert_config()
-    headers = {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "Content-Type": "application/json",
-        "Accept-Profile": SUPABASE_DB_SCHEMA,
-        "Content-Profile": SUPABASE_DB_SCHEMA,
-    }
-    if prefer:
-        headers["Prefer"] = prefer
-
+    headers = _supabase_headers(content_type="application/json", prefer=prefer, include_profiles=True)
     url = f"{SUPABASE_URL}/rest/v1/{path}"
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.request(method=method, url=url, headers=headers, json=body)
@@ -281,12 +298,7 @@ async def _supabase_fetch(path: str, method: str, body: dict[str, Any] | None = 
 
 async def _supabase_count(path: str) -> int:
     _assert_config()
-    headers = {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "Accept-Profile": SUPABASE_DB_SCHEMA,
-        "Prefer": "count=exact",
-    }
+    headers = _supabase_headers(prefer="count=exact", include_profiles=True)
     url = f"{SUPABASE_URL}/rest/v1/{path}"
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.request(method="HEAD", url=url, headers=headers)
@@ -732,10 +744,7 @@ async def _download_resume_bytes(resume_path: str) -> bytes:
     _assert_config()
     encoded_path = quote(resume_path, safe="/")
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{encoded_path}"
-    headers = {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-    }
+    headers = _supabase_headers()
     try:
         async with httpx.AsyncClient(timeout=EXTRACT_DOWNLOAD_TIMEOUT_SECONDS) as client:
             response = await client.get(url, headers=headers)

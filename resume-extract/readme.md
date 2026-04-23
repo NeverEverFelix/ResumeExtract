@@ -30,6 +30,12 @@ Attach worker to the API server process:
 WORKER_ATTACH_TO_API=true uvicorn src.main:app --host 0.0.0.0 --port 3000
 ```
 
+Run multiple attached workers in one instance by using multiple `uvicorn` worker processes:
+
+```bash
+WORKER_ATTACH_TO_API=true uvicorn src.main:app --host 0.0.0.0 --port 3000 --workers 2
+```
+
 ## Run Worker
 
 Run the long-lived worker process (Realtime wakeup + polling fallback):
@@ -44,9 +50,10 @@ Worker env variables:
 - `WORKER_REALTIME_HEARTBEAT_SECONDS` (optional, default `25`)
 - `WORKER_REALTIME_RECONNECT_SECONDS` (optional, default `5`)
 - `WORKER_ATTACH_TO_API` (optional, default `false`; when `true`, worker starts inside API process)
+- `WEB_CONCURRENCY` (optional, Docker default `2`; each API process runs one attached worker when `WORKER_ATTACH_TO_API=true`)
 
 Render note:
-- The provided Docker image sets `WORKER_ATTACH_TO_API=true`, so a single Render web service runs both the API and the extraction worker by default.
+- The provided Docker image sets `WORKER_ATTACH_TO_API=true` and `WEB_CONCURRENCY=2`, so a single Render web service runs both the API and two attached worker processes by default.
 - If you split API and worker into separate services, override `WORKER_ATTACH_TO_API=false` on the web service and run `python -m src.worker` in the worker service.
 
 ## Deploy Worker (systemd)
@@ -75,6 +82,7 @@ Important:
 - The worker uses service-role credentials and atomically claims queued runs in Postgres (`claim_next_resume_run()`), so multiple workers can run safely without double-processing.
 - Update `User`, `Group`, `WorkingDirectory`, and `ExecStart` in the unit file for your server paths.
 - If `WORKER_ATTACH_TO_API=true`, each API process will run a worker. Keep API process count in mind for desired worker concurrency.
+- Multiple API processes increase memory and CPU usage. Start with `WEB_CONCURRENCY=2` and raise it only if the instance has headroom.
 
 ## Test
 

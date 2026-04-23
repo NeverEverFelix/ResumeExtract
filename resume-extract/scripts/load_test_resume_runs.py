@@ -9,6 +9,10 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
+from dotenv import load_dotenv
+
+
+load_dotenv(override=True)
 
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -20,16 +24,21 @@ class LoadTestError(Exception):
     pass
 
 
+def _is_supabase_opaque_key(value: str) -> bool:
+    return value.startswith("sb_secret_") or value.startswith("sb_publishable_")
+
+
 def _headers(*, prefer: str | None = None) -> dict[str, str]:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise LoadTestError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set")
     headers = {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
         "Content-Type": "application/json",
         "Accept-Profile": SUPABASE_DB_SCHEMA,
         "Content-Profile": SUPABASE_DB_SCHEMA,
     }
+    if not _is_supabase_opaque_key(SUPABASE_SERVICE_ROLE_KEY):
+        headers["Authorization"] = f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"
     if prefer:
         headers["Prefer"] = prefer
     return headers
@@ -50,6 +59,12 @@ async def _fetch(
         json=body,
     )
     if response.status_code >= 400:
+        if response.status_code in {401, 403}:
+            raise LoadTestError(
+                f"{method} {path} failed: {response.status_code} auth rejected by Supabase. "
+                "Verify SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, and make sure the service-role key "
+                "has not been revoked or truncated."
+            )
         raise LoadTestError(f"{method} {path} failed: {response.status_code} {response.text}")
     if "application/json" in response.headers.get("content-type", ""):
         return response.json()
@@ -94,7 +109,12 @@ async def _fetch_run_statuses(client: httpx.AsyncClient, run_ids: list[str]) -> 
     ids = ",".join(run_ids)
     rows = await _fetch(
         client,
-        path=f"resume_runs?id=in.({ids})&select=id,status,error_code,created_at,updated_at",
+        path=(
+            "resume_runs"
+            f"?id=in.({ids})"
+            "&select=id,status,error_code,created_at,updated_at,"
+            "extraction_claimed_by,extraction_claimed_at,extraction_heartbeat_at,extraction_attempt_count"
+        ),
         method="GET",
     )
     if not isinstance(rows, list):
@@ -108,6 +128,15 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, int]:
         status = row.get("status")
         if isinstance(status, str):
             counts[status] += 1
+    return dict(counts)
+
+
+def _claimed_by_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts = Counter()
+    for row in rows:
+        claimed_by = row.get("extraction_claimed_by")
+        if isinstance(claimed_by, str) and claimed_by:
+            counts[claimed_by] += 1
     return dict(counts)
 
 
@@ -147,6 +176,8 @@ async def main() -> None:
         )
         return
     started_at = time.monotonic()
+    peak_extracting = 0
+    peak_extracting_at = 0.0
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         run_ids = await _insert_runs(client, rows)
@@ -156,8 +187,23 @@ async def main() -> None:
         while True:
             status_rows = await _fetch_run_statuses(client, run_ids)
             summary = _summarize(status_rows)
+            claimed_by = _claimed_by_counts(status_rows)
             elapsed = time.monotonic() - started_at
-            print(json.dumps({"elapsed_seconds": round(elapsed, 1), "status_counts": summary}, sort_keys=True))
+            extracting_now = summary.get("extracting", 0)
+            if extracting_now > peak_extracting:
+                peak_extracting = extracting_now
+                peak_extracting_at = elapsed
+            print(
+                json.dumps(
+                    {
+                        "elapsed_seconds": round(elapsed, 1),
+                        "status_counts": summary,
+                        "claimed_by_counts": claimed_by,
+                        "peak_extracting_so_far": peak_extracting,
+                    },
+                    sort_keys=True,
+                )
+            )
 
             terminal = summary.get("extracted", 0) + summary.get("failed", 0)
             if terminal >= len(run_ids):
@@ -165,6 +211,10 @@ async def main() -> None:
                     "run_ids": run_ids,
                     "elapsed_seconds": round(elapsed, 3),
                     "status_counts": summary,
+                    "claimed_by_counts": claimed_by,
+                    "peak_extracting": peak_extracting,
+                    "peak_extracting_at_seconds": round(peak_extracting_at, 3),
+                    "distinct_claimed_by": sorted(claimed_by),
                     "rows": status_rows,
                 }
                 if args.summary_json:
@@ -174,7 +224,17 @@ async def main() -> None:
                     with open(args.summary_csv, "w", encoding="utf-8", newline="") as handle:
                         writer = csv.DictWriter(
                             handle,
-                            fieldnames=["id", "status", "error_code", "created_at", "updated_at"],
+                            fieldnames=[
+                                "id",
+                                "status",
+                                "error_code",
+                                "created_at",
+                                "updated_at",
+                                "extraction_claimed_by",
+                                "extraction_claimed_at",
+                                "extraction_heartbeat_at",
+                                "extraction_attempt_count",
+                            ],
                         )
                         writer.writeheader()
                         for row in status_rows:
@@ -185,6 +245,10 @@ async def main() -> None:
                                     "error_code": row.get("error_code"),
                                     "created_at": row.get("created_at"),
                                     "updated_at": row.get("updated_at"),
+                                    "extraction_claimed_by": row.get("extraction_claimed_by"),
+                                    "extraction_claimed_at": row.get("extraction_claimed_at"),
+                                    "extraction_heartbeat_at": row.get("extraction_heartbeat_at"),
+                                    "extraction_attempt_count": row.get("extraction_attempt_count"),
                                 }
                             )
                 return
