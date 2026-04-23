@@ -82,6 +82,34 @@ Important:
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
+## Load Test Harness
+
+Enqueue a batch of synthetic `resume_runs` directly against Supabase and poll drain progress:
+
+```bash
+python scripts/load_test_resume_runs.py \
+  --user-id <auth-user-uuid> \
+  --resume-path <storage/path/to/resume.pdf> \
+  --count 20
+```
+
+Preview the generated rows without inserting anything:
+
+```bash
+python scripts/load_test_resume_runs.py \
+  --user-id <auth-user-uuid> \
+  --resume-path <storage/path/to/resume.pdf> \
+  --count 20 \
+  --dry-run
+```
+
+Notes:
+- `--user-id` must be an existing `auth.users.id`
+- `--resume-path` must already exist in Supabase Storage and point to a supported `.pdf` or `.docx`
+- The script uses `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`
+- It prints live status counts until all runs are `extracted` or `failed`
+- Use `--summary-json` or `--summary-csv` to persist the final batch results
+
 ## CI/CD
 
 GitHub Actions workflows live in:

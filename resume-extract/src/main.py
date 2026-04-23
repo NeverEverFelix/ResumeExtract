@@ -4,9 +4,11 @@ import logging
 import os
 import re
 import shutil
+import socket
 import time
 from collections import Counter
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timedelta, timezone
 from hmac import compare_digest
 from io import BytesIO
 from typing import Any
@@ -57,6 +59,17 @@ WORKER_REALTIME_ENABLED = _env_flag("WORKER_REALTIME_ENABLED", default=True)
 WORKER_REALTIME_HEARTBEAT_SECONDS = float(os.getenv("WORKER_REALTIME_HEARTBEAT_SECONDS", "25"))
 WORKER_REALTIME_RECONNECT_SECONDS = float(os.getenv("WORKER_REALTIME_RECONNECT_SECONDS", "5"))
 WORKER_ATTACH_TO_API = _env_flag("WORKER_ATTACH_TO_API", default=False)
+WORKER_CLAIM_OWNER = os.getenv("WORKER_CLAIM_OWNER", "").strip() or f"worker:{socket.gethostname()}:{os.getpid()}"
+API_CLAIM_OWNER = os.getenv("API_CLAIM_OWNER", "").strip() or f"api:{socket.gethostname()}:{os.getpid()}"
+WORKER_LEASE_SECONDS = int(os.getenv("WORKER_LEASE_SECONDS", "120"))
+RUN_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("RUN_HEARTBEAT_INTERVAL_SECONDS", "15"))
+WORKER_MAX_ATTEMPTS = int(os.getenv("WORKER_MAX_ATTEMPTS", "3"))
+WORKER_RETRY_DELAY_SECONDS = float(os.getenv("WORKER_RETRY_DELAY_SECONDS", "15"))
+WORKER_QUEUE_SNAPSHOT_INTERVAL_SECONDS = float(os.getenv("WORKER_QUEUE_SNAPSHOT_INTERVAL_SECONDS", "60"))
+WORKER_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("WORKER_HEARTBEAT_INTERVAL_SECONDS", "15"))
+WORKER_ACTIVE_WINDOW_SECONDS = int(os.getenv("WORKER_ACTIVE_WINDOW_SECONDS", "45"))
+WORKER_STALE_RESET_LIMIT = int(os.getenv("WORKER_STALE_RESET_LIMIT", "100"))
+WORKER_STALE_RESET_INTERVAL_SECONDS = float(os.getenv("WORKER_STALE_RESET_INTERVAL_SECONDS", "60"))
 
 MAX_RESUME_FILE_SIZE_BYTES = MAX_RESUME_FILE_SIZE_MB * 1024 * 1024
 ALLOWED_BINARY_CONTENT_TYPES = {"application/octet-stream", "binary/octet-stream"}
@@ -266,17 +279,119 @@ async def _supabase_fetch(path: str, method: str, body: dict[str, Any] | None = 
     return None
 
 
-async def _claim_run(run_id: UUID) -> dict[str, Any]:
-    path = f"resume_runs?id=eq.{run_id}&status=eq.queued&select=id,status,user_id,resume_path"
+async def _supabase_count(path: str) -> int:
+    _assert_config()
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Accept-Profile": SUPABASE_DB_SCHEMA,
+        "Prefer": "count=exact",
+    }
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.request(method="HEAD", url=url, headers=headers)
+
+    if response.status_code >= 400:
+        raise HttpError(
+            status=502,
+            code=ERR_DB_ERROR,
+            message=f"Supabase count error: {response.text}",
+        )
+
+    content_range = response.headers.get("content-range", "")
+    if "/" not in content_range:
+        raise HttpError(
+            status=500,
+            code=ERR_DB_ERROR,
+            message="Supabase count response missing content-range header",
+        )
+    try:
+        return int(content_range.rsplit("/", 1)[1])
+    except ValueError as exc:
+        raise HttpError(
+            status=500,
+            code=ERR_DB_ERROR,
+            message="Supabase count response had invalid content-range header",
+        ) from exc
+
+
+async def _register_worker_presence() -> None:
+    await _supabase_fetch(
+        path="extract_worker_heartbeats?on_conflict=worker_id",
+        method="POST",
+        body={
+            "worker_id": WORKER_CLAIM_OWNER,
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "role": "extractor",
+            "started_at": _utc_now_iso(),
+            "last_seen_at": _utc_now_iso(),
+        },
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+
+
+async def _heartbeat_worker_presence() -> None:
+    path = f"extract_worker_heartbeats?worker_id=eq.{_encode_rest_eq_value(WORKER_CLAIM_OWNER)}"
     rows = await _supabase_fetch(
         path=path,
         method="PATCH",
-        body={
-            "status": "extracting",
-            "error_code": None,
-            "error_message": None,
-        },
+        body={"last_seen_at": _utc_now_iso()},
         prefer="return=representation",
+    )
+    if not isinstance(rows, list) or len(rows) == 0:
+        await _register_worker_presence()
+
+
+async def _release_worker_presence() -> None:
+    path = f"extract_worker_heartbeats?worker_id=eq.{_encode_rest_eq_value(WORKER_CLAIM_OWNER)}"
+    await _supabase_fetch(path=path, method="DELETE", prefer="return=minimal")
+
+
+async def _run_worker_presence_heartbeat() -> None:
+    while True:
+        await asyncio.sleep(WORKER_HEARTBEAT_INTERVAL_SECONDS)
+        await _heartbeat_worker_presence()
+
+
+async def _reset_stale_runs(limit: int | None = None) -> list[dict[str, Any]]:
+    rows = await _supabase_fetch(
+        path="rpc/reset_stale_resume_runs",
+        method="POST",
+        body={
+            "p_stale_seconds": WORKER_LEASE_SECONDS,
+            "p_limit": limit if limit is not None else WORKER_STALE_RESET_LIMIT,
+        },
+    )
+    if rows is None:
+        return []
+    if not isinstance(rows, list):
+        raise HttpError(
+            status=500,
+            code=ERR_INVALID_RUN_ROW,
+            message="Reset-stale RPC returned invalid payload",
+        )
+    return rows
+
+
+async def _run_stale_reset_if_due(last_reset_at: float) -> float:
+    now = time.monotonic()
+    if now - last_reset_at < WORKER_STALE_RESET_INTERVAL_SECONDS:
+        return last_reset_at
+    rows = await _reset_stale_runs()
+    if rows:
+        _log_event(phase="worker_stale_reset", reset_count=len(rows))
+    return now
+
+
+async def _claim_run(run_id: UUID) -> dict[str, Any]:
+    rows = await _supabase_fetch(
+        path="rpc/claim_resume_run",
+        method="POST",
+        body={
+            "p_run_id": str(run_id),
+            "p_claimed_by": API_CLAIM_OWNER,
+        },
     )
     if not isinstance(rows, list) or len(rows) == 0:
         raise HttpError(
@@ -291,7 +406,10 @@ async def _claim_next_run() -> dict[str, Any] | None:
     rows = await _supabase_fetch(
         path="rpc/claim_next_resume_run",
         method="POST",
-        body={},
+        body={
+            "p_claimed_by": WORKER_CLAIM_OWNER,
+            "p_lease_seconds": WORKER_LEASE_SECONDS,
+        },
     )
     if rows is None:
         return None
@@ -330,8 +448,127 @@ async def _insert_resume_document(
     )
 
 
-async def _set_run_extracted(run_id: UUID) -> None:
-    path = f"resume_runs?id=eq.{run_id}&status=eq.extracting"
+def _encode_rest_eq_value(value: str) -> str:
+    return quote(value, safe="-_.~:")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _compute_queue_wait_ms(created_at_raw: str | None) -> int | None:
+    created_at = _parse_iso_datetime(created_at_raw)
+    if created_at is None:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - created_at).total_seconds() * 1000))
+
+
+def _failure_bucket(error_code: str) -> str:
+    if error_code in {ERR_DB_ERROR}:
+        return "db"
+    if error_code in {ERR_DOWNLOAD_FAILED}:
+        return "download"
+    if error_code in {ERR_PARSE_ERROR, ERR_EMPTY_EXTRACTED_TEXT, ERR_UNSUPPORTED_FILE_TYPE, ERR_UNSUPPORTED_CONTENT_TYPE}:
+        return "parse"
+    if error_code in {ERR_FILE_TOO_LARGE, ERR_EMPTY_RESUME_FILE}:
+        return "input"
+    if error_code in {ERR_OCR_UNAVAILABLE, ERR_OCR_DEPENDENCY_MISSING}:
+        return "ocr"
+    if error_code in {ERR_MISSING_CONFIG, ERR_INVALID_RUN_ROW, ERR_RUN_NOT_QUEUED, ERR_RUN_NOT_EXTRACTING}:
+        return "system"
+    return "other"
+
+
+def _log_extraction_summary(
+    *,
+    run_id: UUID,
+    status: str,
+    duration_ms: int,
+    parser: str | None = None,
+    attempt_count: int,
+    queue_wait_ms: int | None,
+    error_code: str | None = None,
+    failure_bucket: str | None = None,
+) -> None:
+    _log_event(
+        phase="extract_summary",
+        run_id=run_id,
+        parser=parser,
+        duration_ms=duration_ms,
+        status=status,
+        attempt_count=attempt_count,
+        queue_wait_ms=queue_wait_ms,
+        error_code=error_code,
+        failure_bucket=failure_bucket,
+    )
+
+
+def _resume_runs_count_path(*filters: str) -> str:
+    query = "&".join(["select=id", *filters])
+    return f"resume_runs?{query}"
+
+
+async def _get_queue_snapshot() -> dict[str, int]:
+    now = datetime.now(timezone.utc)
+    cutoff_1m = (now - timedelta(minutes=1)).isoformat()
+    cutoff_5m = (now - timedelta(minutes=5)).isoformat()
+    cutoff_15m = (now - timedelta(minutes=15)).isoformat()
+    active_worker_cutoff = (now - timedelta(seconds=max(WORKER_ACTIVE_WINDOW_SECONDS, 1))).isoformat()
+    stale_extracting_cutoff = (now - timedelta(seconds=max(WORKER_LEASE_SECONDS, 1))).isoformat()
+    queued_total = await _supabase_count(_resume_runs_count_path("status=eq.queued"))
+    queued_over_1m = await _supabase_count(
+        _resume_runs_count_path("status=eq.queued", f"created_at=lte.{quote(cutoff_1m, safe='')}")
+    )
+    queued_over_5m = await _supabase_count(
+        _resume_runs_count_path("status=eq.queued", f"created_at=lte.{quote(cutoff_5m, safe='')}")
+    )
+    queued_over_15m = await _supabase_count(
+        _resume_runs_count_path("status=eq.queued", f"created_at=lte.{quote(cutoff_15m, safe='')}")
+    )
+    extracting_total = await _supabase_count(_resume_runs_count_path("status=eq.extracting"))
+    stale_extracting_total = await _supabase_count(
+        _resume_runs_count_path(
+            "status=eq.extracting",
+            f"extraction_heartbeat_at=lte.{quote(stale_extracting_cutoff, safe='')}",
+        )
+    )
+    active_workers = await _supabase_count(
+        "extract_worker_heartbeats?"
+        + "&".join(
+            [
+                "select=worker_id",
+                f"last_seen_at=gte.{quote(active_worker_cutoff, safe='')}",
+            ]
+        )
+    )
+    return {
+        "queued_total": queued_total,
+        "queued_over_1m": queued_over_1m,
+        "queued_over_5m": queued_over_5m,
+        "queued_over_15m": queued_over_15m,
+        "extracting_total": extracting_total,
+        "stale_extracting_total": stale_extracting_total,
+        "active_workers": active_workers,
+    }
+
+
+async def _set_run_extracted(run_id: UUID, claimed_by: str) -> None:
+    path = (
+        f"resume_runs?id=eq.{run_id}&status=eq.extracting"
+        f"&extraction_claimed_by=eq.{_encode_rest_eq_value(claimed_by)}"
+    )
     rows = await _supabase_fetch(
         path=path,
         method="PATCH",
@@ -339,6 +576,9 @@ async def _set_run_extracted(run_id: UUID) -> None:
             "status": "extracted",
             "error_code": None,
             "error_message": None,
+            "extraction_claimed_by": None,
+            "extraction_claimed_at": None,
+            "extraction_heartbeat_at": None,
         },
         prefer="return=representation",
     )
@@ -350,8 +590,11 @@ async def _set_run_extracted(run_id: UUID) -> None:
         )
 
 
-async def _set_run_failed(run_id: UUID, code: str, message: str) -> None:
-    path = f"resume_runs?id=eq.{run_id}&status=eq.extracting"
+async def _set_run_failed(run_id: UUID, claimed_by: str, code: str, message: str) -> None:
+    path = (
+        f"resume_runs?id=eq.{run_id}&status=eq.extracting"
+        f"&extraction_claimed_by=eq.{_encode_rest_eq_value(claimed_by)}"
+    )
     rows = await _supabase_fetch(
         path=path,
         method="PATCH",
@@ -359,6 +602,10 @@ async def _set_run_failed(run_id: UUID, code: str, message: str) -> None:
             "status": "failed",
             "error_code": code,
             "error_message": message[:400],
+            "extraction_claimed_by": None,
+            "extraction_claimed_at": None,
+            "extraction_heartbeat_at": None,
+            "extraction_next_retry_at": None,
         },
         prefer="return=representation",
     )
@@ -368,6 +615,67 @@ async def _set_run_failed(run_id: UUID, code: str, message: str) -> None:
             code=ERR_RUN_NOT_EXTRACTING,
             message="Run is not in extracting state during failure finalize",
         )
+
+
+async def _requeue_run(run_id: UUID, claimed_by: str, code: str, message: str, delay_seconds: float) -> None:
+    retry_at = datetime.now(timezone.utc).timestamp() + max(delay_seconds, 1)
+    path = (
+        f"resume_runs?id=eq.{run_id}&status=eq.extracting"
+        f"&extraction_claimed_by=eq.{_encode_rest_eq_value(claimed_by)}"
+    )
+    rows = await _supabase_fetch(
+        path=path,
+        method="PATCH",
+        body={
+            "status": "queued",
+            "error_code": code,
+            "error_message": message[:400],
+            "extraction_claimed_by": None,
+            "extraction_claimed_at": None,
+            "extraction_heartbeat_at": None,
+            "extraction_next_retry_at": datetime.fromtimestamp(retry_at, timezone.utc).isoformat(),
+        },
+        prefer="return=representation",
+    )
+    if not isinstance(rows, list) or len(rows) == 0:
+        raise HttpError(
+            status=409,
+            code=ERR_RUN_NOT_EXTRACTING,
+            message="Run is not in extracting state during retry requeue",
+        )
+
+
+def _is_retryable_error(error: Exception, error_code: str) -> bool:
+    if isinstance(error, HttpError):
+        if error_code in {ERR_DB_ERROR, ERR_DOWNLOAD_FAILED}:
+            return True
+        return error.status >= 500 and error_code not in {ERR_MISSING_CONFIG, ERR_OCR_DEPENDENCY_MISSING}
+    return False
+
+
+async def _heartbeat_claimed_run(run_id: UUID, claimed_by: str) -> None:
+    path = (
+        f"resume_runs?id=eq.{run_id}&status=eq.extracting"
+        f"&extraction_claimed_by=eq.{_encode_rest_eq_value(claimed_by)}"
+    )
+    rows = await _supabase_fetch(
+        path=path,
+        method="PATCH",
+        body={"extraction_heartbeat_at": _utc_now_iso()},
+        prefer="return=representation",
+    )
+    if not isinstance(rows, list) or len(rows) == 0:
+        raise HttpError(
+            status=409,
+            code=ERR_RUN_NOT_EXTRACTING,
+            message="Run is not in extracting state during heartbeat",
+        )
+
+
+async def _run_claim_heartbeat(run_id: UUID, claimed_by: str) -> None:
+    while True:
+        await asyncio.sleep(RUN_HEARTBEAT_INTERVAL_SECONDS)
+        await _heartbeat_claimed_run(run_id, claimed_by)
 
 
 def _normalize_line(line: str) -> str:
@@ -577,9 +885,17 @@ async def _perform_extraction(resume_path: str) -> tuple[str, dict[str, Any]]:
     )
 
 
-async def _process_claimed_run(run_id: UUID, run_user_id: str, run_resume_path: str) -> None:
+async def _process_claimed_run(
+    run_id: UUID,
+    run_user_id: str,
+    run_resume_path: str,
+    claimed_by: str,
+    attempt_count: int,
+    queue_wait_ms: int | None,
+) -> None:
     parser_name: str | None = None
     request_start = time.perf_counter()
+    heartbeat_task = asyncio.create_task(_run_claim_heartbeat(run_id, claimed_by))
     try:
         extraction_start = time.perf_counter()
         extracted_text, metadata = await _perform_extraction(run_resume_path)
@@ -602,7 +918,7 @@ async def _process_claimed_run(run_id: UUID, run_user_id: str, run_resume_path: 
         )
 
         finalize_start = time.perf_counter()
-        await _set_run_extracted(run_id)
+        await _set_run_extracted(run_id, claimed_by)
         _log_event(
             phase="finalize_complete",
             run_id=run_id,
@@ -614,11 +930,22 @@ async def _process_claimed_run(run_id: UUID, run_user_id: str, run_resume_path: 
             run_id=run_id,
             parser=parser_name,
             duration_ms=int((time.perf_counter() - request_start) * 1000),
+            attempt_count=attempt_count,
+            queue_wait_ms=queue_wait_ms,
+        )
+        _log_extraction_summary(
+            run_id=run_id,
+            status="success",
+            parser=parser_name,
+            duration_ms=int((time.perf_counter() - request_start) * 1000),
+            attempt_count=attempt_count,
+            queue_wait_ms=queue_wait_ms,
         )
     except Exception as error:  # pragma: no cover
         _capture_exception(error, phase="process_claimed_run", run_id=run_id, parser=parser_name)
         error_code = error.code if isinstance(error, HttpError) else ERR_PARSE_ERROR
         error_message = str(error) if str(error) else "Unknown extraction failure"
+        failure_bucket = _failure_bucket(error_code)
         _log_event(
             phase="extract_error",
             run_id=run_id,
@@ -626,27 +953,81 @@ async def _process_claimed_run(run_id: UUID, run_user_id: str, run_resume_path: 
             duration_ms=int((time.perf_counter() - request_start) * 1000),
             error_code=error_code,
             error_message=error_message,
+            failure_bucket=failure_bucket,
+            attempt_count=attempt_count,
+            queue_wait_ms=queue_wait_ms,
         )
         try:
-            failed_start = time.perf_counter()
-            await _set_run_failed(run_id, error_code, error_message)
-            _log_event(
-                phase="failed_status_set",
-                run_id=run_id,
-                parser=parser_name,
-                duration_ms=int((time.perf_counter() - failed_start) * 1000),
-                error_code=error_code,
-            )
+            if _is_retryable_error(error, error_code) and attempt_count < WORKER_MAX_ATTEMPTS:
+                retry_start = time.perf_counter()
+                await _requeue_run(
+                    run_id,
+                    claimed_by,
+                    error_code,
+                    error_message,
+                    WORKER_RETRY_DELAY_SECONDS,
+                )
+                _log_event(
+                    phase="retry_requeued",
+                    run_id=run_id,
+                    parser=parser_name,
+                    duration_ms=int((time.perf_counter() - retry_start) * 1000),
+                    error_code=error_code,
+                    failure_bucket=failure_bucket,
+                    attempt_count=attempt_count,
+                    next_attempt=attempt_count + 1,
+                    queue_wait_ms=queue_wait_ms,
+                )
+                _log_extraction_summary(
+                    run_id=run_id,
+                    status="requeued",
+                    parser=parser_name,
+                    duration_ms=int((time.perf_counter() - request_start) * 1000),
+                    attempt_count=attempt_count,
+                    queue_wait_ms=queue_wait_ms,
+                    error_code=error_code,
+                    failure_bucket=failure_bucket,
+                )
+            else:
+                failed_start = time.perf_counter()
+                await _set_run_failed(run_id, claimed_by, error_code, error_message)
+                _log_event(
+                    phase="failed_status_set",
+                    run_id=run_id,
+                    parser=parser_name,
+                    duration_ms=int((time.perf_counter() - failed_start) * 1000),
+                    error_code=error_code,
+                    failure_bucket=failure_bucket,
+                    attempt_count=attempt_count,
+                    queue_wait_ms=queue_wait_ms,
+                )
+                _log_extraction_summary(
+                    run_id=run_id,
+                    status="failed",
+                    parser=parser_name,
+                    duration_ms=int((time.perf_counter() - request_start) * 1000),
+                    attempt_count=attempt_count,
+                    queue_wait_ms=queue_wait_ms,
+                    error_code=error_code,
+                    failure_bucket=failure_bucket,
+                )
         except Exception:
             _log_event(
                 phase="failed_status_set_error",
                 run_id=run_id,
                 parser=parser_name,
                 error_code=error_code,
+                failure_bucket=failure_bucket,
+                attempt_count=attempt_count,
+                queue_wait_ms=queue_wait_ms,
             )
         if isinstance(error, HttpError):
             raise error
         raise HttpError(status=500, code=error_code, message=error_message)
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
 
 
 async def _run_worker_once() -> bool:
@@ -657,18 +1038,38 @@ async def _run_worker_once() -> bool:
     run_id_raw = claimed.get("id")
     run_user_id_raw = claimed.get("user_id")
     run_resume_path = claimed.get("resume_path")
+    run_attempt_count_raw = claimed.get("extraction_attempt_count")
+    run_created_at_raw = claimed.get("created_at")
 
-    if not isinstance(run_id_raw, str) or not isinstance(run_user_id_raw, str) or not isinstance(run_resume_path, str):
+    if (
+        not isinstance(run_id_raw, str)
+        or not isinstance(run_user_id_raw, str)
+        or not isinstance(run_resume_path, str)
+        or not isinstance(run_attempt_count_raw, int)
+    ):
         raise HttpError(
             status=500,
             code=ERR_INVALID_RUN_ROW,
-            message="Claim-next row is missing id, user_id, or resume_path",
+            message="Claim-next row is missing id, user_id, resume_path, or extraction_attempt_count",
         )
 
     run_id = UUID(run_id_raw)
-    _log_event(phase="worker_claimed", run_id=run_id)
+    queue_wait_ms = _compute_queue_wait_ms(run_created_at_raw if isinstance(run_created_at_raw, str) else None)
+    _log_event(
+        phase="worker_claimed",
+        run_id=run_id,
+        attempt_count=run_attempt_count_raw,
+        queue_wait_ms=queue_wait_ms,
+    )
     try:
-        await _process_claimed_run(run_id, run_user_id_raw, run_resume_path)
+        await _process_claimed_run(
+            run_id,
+            run_user_id_raw,
+            run_resume_path,
+            WORKER_CLAIM_OWNER,
+            run_attempt_count_raw,
+            queue_wait_ms,
+        )
     except HttpError:
         # Failure details and run status are handled in _process_claimed_run.
         pass
@@ -678,15 +1079,28 @@ async def _run_worker_once() -> bool:
 async def run_worker_forever() -> None:
     wake_event = asyncio.Event()
     realtime_task: asyncio.Task[None] | None = None
+    worker_presence_task: asyncio.Task[None] | None = None
     idle_cycles = 0
     idle_log_every_cycles = max(1, int(60 / max(WORKER_POLL_INTERVAL_SECONDS, 0.1)))
+    last_queue_snapshot_at = 0.0
+    last_stale_reset_at = 0.0
     if WORKER_REALTIME_ENABLED:
         realtime_task = asyncio.create_task(_run_realtime_wakeup_loop(wake_event))
+    await _register_worker_presence()
+    worker_presence_task = asyncio.create_task(_run_worker_presence_heartbeat())
 
     _log_event(
         phase="worker_start",
+        worker_id=WORKER_CLAIM_OWNER,
         poll_interval_seconds=WORKER_POLL_INTERVAL_SECONDS,
         realtime_enabled=WORKER_REALTIME_ENABLED,
+        lease_seconds=WORKER_LEASE_SECONDS,
+        run_heartbeat_interval_seconds=RUN_HEARTBEAT_INTERVAL_SECONDS,
+        worker_heartbeat_interval_seconds=WORKER_HEARTBEAT_INTERVAL_SECONDS,
+        retry_delay_seconds=WORKER_RETRY_DELAY_SECONDS,
+        max_attempts=WORKER_MAX_ATTEMPTS,
+        queue_snapshot_interval_seconds=WORKER_QUEUE_SNAPSHOT_INTERVAL_SECONDS,
+        active_worker_window_seconds=WORKER_ACTIVE_WINDOW_SECONDS,
     )
     try:
         while True:
@@ -710,6 +1124,14 @@ async def run_worker_forever() -> None:
                         idle_seconds=int(idle_cycles * WORKER_POLL_INTERVAL_SECONDS),
                     )
 
+                now = time.monotonic()
+                if now - last_queue_snapshot_at >= WORKER_QUEUE_SNAPSHOT_INTERVAL_SECONDS:
+                    snapshot = await _get_queue_snapshot()
+                    _log_event(phase="worker_queue_snapshot", **snapshot)
+                    last_queue_snapshot_at = now
+
+                last_stale_reset_at = await _run_stale_reset_if_due(last_stale_reset_at)
+
                 try:
                     await asyncio.wait_for(wake_event.wait(), timeout=WORKER_POLL_INTERVAL_SECONDS)
                     wake_event.clear()
@@ -724,6 +1146,13 @@ async def run_worker_forever() -> None:
                 _capture_exception(error, phase="worker_loop")
                 await asyncio.sleep(WORKER_POLL_INTERVAL_SECONDS)
     finally:
+        if worker_presence_task:
+            worker_presence_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker_presence_task
+        with suppress(Exception):
+            await _release_worker_presence()
+        _log_event(phase="worker_stop", worker_id=WORKER_CLAIM_OWNER)
         if realtime_task:
             realtime_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -873,12 +1302,33 @@ async def extract(
 
     run_user_id = run_row.get("user_id")
     run_resume_path = run_row.get("resume_path")
-    if not isinstance(run_user_id, str) or not isinstance(run_resume_path, str):
+    run_attempt_count = run_row.get("extraction_attempt_count")
+    run_created_at = run_row.get("created_at")
+    if (
+        not isinstance(run_user_id, str)
+        or not isinstance(run_resume_path, str)
+        or not isinstance(run_attempt_count, int)
+    ):
         raise HttpError(
             status=500,
             code=ERR_INVALID_RUN_ROW,
-            message="Claimed run is missing user_id or resume_path",
+            message="Claimed run is missing user_id, resume_path, or extraction_attempt_count",
         )
 
-    await _process_claimed_run(run_id, run_user_id, run_resume_path)
+    queue_wait_ms = _compute_queue_wait_ms(run_created_at if isinstance(run_created_at, str) else None)
+    _log_event(
+        phase="api_claimed",
+        run_id=run_id,
+        attempt_count=run_attempt_count,
+        queue_wait_ms=queue_wait_ms,
+    )
+
+    await _process_claimed_run(
+        run_id,
+        run_user_id,
+        run_resume_path,
+        API_CLAIM_OWNER,
+        run_attempt_count,
+        queue_wait_ms,
+    )
     return {"ok": True, "run_id": str(run_id), "status": "extracted"}
