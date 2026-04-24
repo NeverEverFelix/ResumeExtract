@@ -182,7 +182,7 @@ Behavior (status contract):
 1. Claims run atomically (`queued -> extracting`) using a conditional update.
 2. Downloads resume from Supabase Storage with safety guards (timeout, content-type validation, max file size) and extracts clean text (`.pdf` / `.docx`), with OCR fallback for scanned PDFs.
 3. Persists one `resume_documents` row for the run (`run_id`-keyed upsert for idempotent retries).
-4. Finalizes run to `extracted`.
+4. Finalizes run to `queued_generate`.
 5. On failure after claim, marks run `failed` with `error_code` and `error_message`.
 
 Retry semantics:

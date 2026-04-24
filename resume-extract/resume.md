@@ -19,10 +19,11 @@ No schema changes are required.
   - Extraction service has successfully claimed the run.
   - No other worker/service may process this run.
 
-- **extracted**
+- **queued_generate**
   - Extraction completed successfully.
   - A corresponding row exists in `resume_documents`.
   - Resume text is now the durable source of truth.
+  - The run is ready for generation workers to claim.
 
 - **failed**
   - Terminal failure during extraction.
@@ -58,7 +59,7 @@ The extraction service **must** follow this sequence:
 5. **Finalize**
    - Update run status to:
      ```
-     status = 'extracted'
+     status = 'queued_generate'
      ```
    - This step must only occur **after** `resume_documents` insertion succeeds.
 

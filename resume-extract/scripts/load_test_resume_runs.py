@@ -178,6 +178,7 @@ async def main() -> None:
     started_at = time.monotonic()
     peak_extracting = 0
     peak_extracting_at = 0.0
+    claimed_by_seen: set[str] = set()
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         run_ids = await _insert_runs(client, rows)
@@ -188,6 +189,7 @@ async def main() -> None:
             status_rows = await _fetch_run_statuses(client, run_ids)
             summary = _summarize(status_rows)
             claimed_by = _claimed_by_counts(status_rows)
+            claimed_by_seen.update(claimed_by)
             elapsed = time.monotonic() - started_at
             extracting_now = summary.get("extracting", 0)
             if extracting_now > peak_extracting:
@@ -214,7 +216,7 @@ async def main() -> None:
                     "claimed_by_counts": claimed_by,
                     "peak_extracting": peak_extracting,
                     "peak_extracting_at_seconds": round(peak_extracting_at, 3),
-                    "distinct_claimed_by": sorted(claimed_by),
+                    "distinct_claimed_by": sorted(claimed_by_seen),
                     "rows": status_rows,
                 }
                 if args.summary_json:

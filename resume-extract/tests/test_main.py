@@ -34,7 +34,7 @@ class MainTests(unittest.TestCase):
     def test_extract_success_contract_flow(self) -> None:
         run_id = uuid4()
         insert_mock = AsyncMock()
-        set_extracted_mock = AsyncMock()
+        set_ready_mock = AsyncMock()
 
         with (
             patch.object(
@@ -52,7 +52,7 @@ class MainTests(unittest.TestCase):
             ),
             patch.object(main, "_perform_extraction", AsyncMock(return_value=("Extracted text", {"parser": "fake"}))),
             patch.object(main, "_insert_resume_document", insert_mock),
-            patch.object(main, "_set_run_extracted", set_extracted_mock),
+            patch.object(main, "_set_run_ready_for_generation", set_ready_mock),
         ):
             response = self.client.post(
                 "/extract",
@@ -61,11 +61,11 @@ class MainTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"ok": True, "run_id": str(run_id), "status": "extracted"})
+        self.assertEqual(response.json(), {"ok": True, "run_id": str(run_id), "status": "queued_generate"})
         insert_mock.assert_awaited_once_with(
             run_id, "user-123", "user-123/resume.pdf", "Extracted text", {"parser": "fake"}
         )
-        set_extracted_mock.assert_awaited_once_with(run_id, "api:test-owner")
+        set_ready_mock.assert_awaited_once_with(run_id, "api:test-owner")
 
     def test_insert_resume_document_uses_upsert_for_retry_idempotency(self) -> None:
         with patch.object(main, "_supabase_fetch", AsyncMock()) as fetch_mock:
@@ -217,7 +217,7 @@ class MainTests(unittest.TestCase):
             patch.object(main, "_perform_extraction", AsyncMock(side_effect=ValueError("boom"))),
             patch.object(main, "_set_run_failed", set_failed_mock),
             patch.object(main, "_requeue_run", AsyncMock()),
-            patch.object(main, "_set_run_extracted", AsyncMock()),
+            patch.object(main, "_set_run_ready_for_generation", AsyncMock()),
         ):
             response = self.client.post(
                 "/extract",

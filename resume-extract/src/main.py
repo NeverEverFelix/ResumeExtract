@@ -70,6 +70,18 @@ WORKER_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("WORKER_HEARTBEAT_INTERVAL_S
 WORKER_ACTIVE_WINDOW_SECONDS = int(os.getenv("WORKER_ACTIVE_WINDOW_SECONDS", "45"))
 WORKER_STALE_RESET_LIMIT = int(os.getenv("WORKER_STALE_RESET_LIMIT", "100"))
 WORKER_STALE_RESET_INTERVAL_SECONDS = float(os.getenv("WORKER_STALE_RESET_INTERVAL_SECONDS", "60"))
+GENERATION_WORKER_ENABLED = _env_flag("GENERATION_WORKER_ENABLED", default=True)
+GENERATION_WORKER_CLAIM_OWNER = os.getenv("GENERATION_WORKER_CLAIM_OWNER", "").strip() or f"generate:{socket.gethostname()}:{os.getpid()}"
+GENERATION_WORKER_LEASE_SECONDS = int(os.getenv("GENERATION_WORKER_LEASE_SECONDS", "300"))
+GENERATION_WORKER_MAX_ATTEMPTS = int(os.getenv("GENERATION_WORKER_MAX_ATTEMPTS", "3"))
+GENERATION_RETRY_DELAY_SECONDS = float(os.getenv("GENERATION_RETRY_DELAY_SECONDS", "30"))
+GENERATION_RUN_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("GENERATION_RUN_HEARTBEAT_INTERVAL_SECONDS", "20"))
+PDF_WORKER_ENABLED = _env_flag("PDF_WORKER_ENABLED", default=True)
+PDF_WORKER_CLAIM_OWNER = os.getenv("PDF_WORKER_CLAIM_OWNER", "").strip() or f"pdf:{socket.gethostname()}:{os.getpid()}"
+PDF_WORKER_LEASE_SECONDS = int(os.getenv("PDF_WORKER_LEASE_SECONDS", "300"))
+PDF_WORKER_MAX_ATTEMPTS = int(os.getenv("PDF_WORKER_MAX_ATTEMPTS", "3"))
+PDF_RETRY_DELAY_SECONDS = float(os.getenv("PDF_RETRY_DELAY_SECONDS", "30"))
+PDF_RUN_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("PDF_RUN_HEARTBEAT_INTERVAL_SECONDS", "20"))
 
 MAX_RESUME_FILE_SIZE_BYTES = MAX_RESUME_FILE_SIZE_MB * 1024 * 1024
 ALLOWED_BINARY_CONTENT_TYPES = {"application/octet-stream", "binary/octet-stream"}
@@ -120,6 +132,10 @@ ERR_EMPTY_EXTRACTED_TEXT = "empty_extracted_text"
 ERR_PARSE_ERROR = "parse_error"
 ERR_OCR_UNAVAILABLE = "ocr_unavailable"
 ERR_OCR_DEPENDENCY_MISSING = "ocr_dependency_missing"
+ERR_GENERATE_NOT_QUEUED = "generate_not_queued"
+ERR_GENERATE_NOT_CLAIMED = "generate_not_claimed"
+ERR_FUNCTION_CALL_FAILED = "function_call_failed"
+ERR_PDF_NOT_CLAIMED = "pdf_not_claimed"
 
 BULLET_PREFIX_RE = re.compile(r"^[\-\*\u2022\u2023\u25E6\u2043\u2219\u00B7]+[\s\t]*")
 PAGE_MARKER_RE = re.compile(
@@ -527,6 +543,46 @@ def _log_extraction_summary(
     )
 
 
+def _log_generation_summary(
+    *,
+    run_id: UUID,
+    status: str,
+    duration_ms: int,
+    attempt_count: int,
+    queue_wait_ms: int | None,
+    error_code: str | None = None,
+) -> None:
+    _log_event(
+        phase="generate_summary",
+        run_id=run_id,
+        duration_ms=duration_ms,
+        status=status,
+        attempt_count=attempt_count,
+        queue_wait_ms=queue_wait_ms,
+        error_code=error_code,
+    )
+
+
+def _log_pdf_summary(
+    *,
+    run_id: UUID,
+    status: str,
+    duration_ms: int,
+    attempt_count: int,
+    queue_wait_ms: int | None,
+    error_code: str | None = None,
+) -> None:
+    _log_event(
+        phase="pdf_summary",
+        run_id=run_id,
+        duration_ms=duration_ms,
+        status=status,
+        attempt_count=attempt_count,
+        queue_wait_ms=queue_wait_ms,
+        error_code=error_code,
+    )
+
+
 def _resume_runs_count_path(*filters: str) -> str:
     query = "&".join(["select=id", *filters])
     return f"resume_runs?{query}"
@@ -539,6 +595,8 @@ async def _get_queue_snapshot() -> dict[str, int]:
     cutoff_15m = (now - timedelta(minutes=15)).isoformat()
     active_worker_cutoff = (now - timedelta(seconds=max(WORKER_ACTIVE_WINDOW_SECONDS, 1))).isoformat()
     stale_extracting_cutoff = (now - timedelta(seconds=max(WORKER_LEASE_SECONDS, 1))).isoformat()
+    stale_generating_cutoff = (now - timedelta(seconds=max(GENERATION_WORKER_LEASE_SECONDS, 1))).isoformat()
+    stale_pdf_cutoff = (now - timedelta(seconds=max(PDF_WORKER_LEASE_SECONDS, 1))).isoformat()
     queued_total = await _supabase_count(_resume_runs_count_path("status=eq.queued"))
     queued_over_1m = await _supabase_count(
         _resume_runs_count_path("status=eq.queued", f"created_at=lte.{quote(cutoff_1m, safe='')}")
@@ -556,6 +614,36 @@ async def _get_queue_snapshot() -> dict[str, int]:
             f"extraction_heartbeat_at=lte.{quote(stale_extracting_cutoff, safe='')}",
         )
     )
+    queued_generate_total = await _supabase_count(_resume_runs_count_path("status=eq.queued_generate"))
+    queued_generate_over_1m = await _supabase_count(
+        _resume_runs_count_path("status=eq.queued_generate", f"updated_at=lte.{quote(cutoff_1m, safe='')}")
+    )
+    queued_generate_over_5m = await _supabase_count(
+        _resume_runs_count_path("status=eq.queued_generate", f"updated_at=lte.{quote(cutoff_5m, safe='')}")
+    )
+    generating_total = await _supabase_count(_resume_runs_count_path("status=eq.generating"))
+    stale_generating_total = await _supabase_count(
+        _resume_runs_count_path(
+            "status=eq.generating",
+            f"generation_heartbeat_at=lte.{quote(stale_generating_cutoff, safe='')}",
+        )
+    )
+    queued_pdf_total = await _supabase_count(_resume_runs_count_path("status=eq.queued_pdf"))
+    queued_pdf_over_1m = await _supabase_count(
+        _resume_runs_count_path("status=eq.queued_pdf", f"updated_at=lte.{quote(cutoff_1m, safe='')}")
+    )
+    queued_pdf_over_5m = await _supabase_count(
+        _resume_runs_count_path("status=eq.queued_pdf", f"updated_at=lte.{quote(cutoff_5m, safe='')}")
+    )
+    compiling_pdf_total = await _supabase_count(_resume_runs_count_path("status=eq.compiling_pdf"))
+    stale_compiling_pdf_total = await _supabase_count(
+        _resume_runs_count_path(
+            "status=eq.compiling_pdf",
+            f"pdf_heartbeat_at=lte.{quote(stale_pdf_cutoff, safe='')}",
+        )
+    )
+    completed_total = await _supabase_count(_resume_runs_count_path("status=eq.completed"))
+    failed_total = await _supabase_count(_resume_runs_count_path("status=eq.failed"))
     active_workers = await _supabase_count(
         "extract_worker_heartbeats?"
         + "&".join(
@@ -572,11 +660,23 @@ async def _get_queue_snapshot() -> dict[str, int]:
         "queued_over_15m": queued_over_15m,
         "extracting_total": extracting_total,
         "stale_extracting_total": stale_extracting_total,
+        "queued_generate_total": queued_generate_total,
+        "queued_generate_over_1m": queued_generate_over_1m,
+        "queued_generate_over_5m": queued_generate_over_5m,
+        "generating_total": generating_total,
+        "stale_generating_total": stale_generating_total,
+        "queued_pdf_total": queued_pdf_total,
+        "queued_pdf_over_1m": queued_pdf_over_1m,
+        "queued_pdf_over_5m": queued_pdf_over_5m,
+        "compiling_pdf_total": compiling_pdf_total,
+        "stale_compiling_pdf_total": stale_compiling_pdf_total,
+        "completed_total": completed_total,
+        "failed_total": failed_total,
         "active_workers": active_workers,
     }
 
 
-async def _set_run_extracted(run_id: UUID, claimed_by: str) -> None:
+async def _set_run_ready_for_generation(run_id: UUID, claimed_by: str) -> None:
     path = (
         f"resume_runs?id=eq.{run_id}&status=eq.extracting"
         f"&extraction_claimed_by=eq.{_encode_rest_eq_value(claimed_by)}"
@@ -585,7 +685,7 @@ async def _set_run_extracted(run_id: UUID, claimed_by: str) -> None:
         path=path,
         method="PATCH",
         body={
-            "status": "extracted",
+            "status": "queued_generate",
             "error_code": None,
             "error_message": None,
             "extraction_claimed_by": None,
@@ -688,6 +788,375 @@ async def _run_claim_heartbeat(run_id: UUID, claimed_by: str) -> None:
     while True:
         await asyncio.sleep(RUN_HEARTBEAT_INTERVAL_SECONDS)
         await _heartbeat_claimed_run(run_id, claimed_by)
+
+
+async def _claim_next_generate_run() -> dict[str, Any] | None:
+    rows = await _supabase_fetch(
+        path="rpc/claim_next_generate_run",
+        method="POST",
+        body={"p_claimed_by": GENERATION_WORKER_CLAIM_OWNER, "p_lease_seconds": GENERATION_WORKER_LEASE_SECONDS},
+    )
+    if rows is None:
+        return None
+    if not isinstance(rows, list):
+        raise HttpError(status=500, code=ERR_INVALID_RUN_ROW, message="claim_next_generate_run returned invalid payload")
+    if not rows:
+        return None
+    row = rows[0]
+    if not isinstance(row, dict):
+        raise HttpError(status=500, code=ERR_INVALID_RUN_ROW, message="claim_next_generate_run returned invalid row")
+    return row
+
+
+async def _heartbeat_claimed_generate_run(run_id: UUID, claimed_by: str) -> None:
+    path = (
+        f"resume_runs?id=eq.{run_id}&status=eq.generating"
+        f"&generation_claimed_by=eq.{_encode_rest_eq_value(claimed_by)}"
+    )
+    rows = await _supabase_fetch(
+        path=path,
+        method="PATCH",
+        body={"generation_heartbeat_at": _utc_now_iso()},
+        prefer="return=representation",
+    )
+    if not isinstance(rows, list) or len(rows) == 0:
+        raise HttpError(
+            status=409,
+            code=ERR_GENERATE_NOT_CLAIMED,
+            message="Run is not in generating state during generation heartbeat",
+        )
+
+
+async def _run_generation_claim_heartbeat(run_id: UUID, claimed_by: str) -> None:
+    while True:
+        await asyncio.sleep(GENERATION_RUN_HEARTBEAT_INTERVAL_SECONDS)
+        await _heartbeat_claimed_generate_run(run_id, claimed_by)
+
+
+async def _requeue_generate_run(run_id: UUID, claimed_by: str, code: str, message: str, delay_seconds: float) -> None:
+    retry_at = datetime.now(timezone.utc).timestamp() + max(delay_seconds, 1)
+    path = (
+        f"resume_runs?id=eq.{run_id}&status=eq.generating"
+        f"&generation_claimed_by=eq.{_encode_rest_eq_value(claimed_by)}"
+    )
+    rows = await _supabase_fetch(
+        path=path,
+        method="PATCH",
+        body={
+            "status": "queued_generate",
+            "error_code": code,
+            "error_message": message[:400],
+            "generation_claimed_by": None,
+            "generation_claimed_at": None,
+            "generation_heartbeat_at": None,
+            "generation_next_retry_at": datetime.fromtimestamp(retry_at, timezone.utc).isoformat(),
+        },
+        prefer="return=representation",
+    )
+    if not isinstance(rows, list) or len(rows) == 0:
+        raise HttpError(
+            status=409,
+            code=ERR_GENERATE_NOT_CLAIMED,
+            message="Run is not in generating state during generation retry requeue",
+        )
+
+
+async def _set_generate_failed(run_id: UUID, claimed_by: str, code: str, message: str) -> None:
+    path = (
+        f"resume_runs?id=eq.{run_id}&status=eq.generating"
+        f"&generation_claimed_by=eq.{_encode_rest_eq_value(claimed_by)}"
+    )
+    rows = await _supabase_fetch(
+        path=path,
+        method="PATCH",
+        body={
+            "status": "failed",
+            "error_code": code,
+            "error_message": message[:400],
+            "generation_claimed_by": None,
+            "generation_claimed_at": None,
+            "generation_heartbeat_at": None,
+            "generation_next_retry_at": None,
+        },
+        prefer="return=representation",
+    )
+    if not isinstance(rows, list) or len(rows) == 0:
+        raise HttpError(
+            status=409,
+            code=ERR_GENERATE_NOT_CLAIMED,
+            message="Run is not in generating state during generation failure finalize",
+        )
+
+
+async def _invoke_supabase_function(function_name: str, body: dict[str, Any]) -> dict[str, Any]:
+    _assert_config()
+    url = f"{SUPABASE_URL}/functions/v1/{function_name}"
+    headers = _supabase_headers(content_type="application/json")
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(url, headers=headers, json=body)
+
+    payload = response.json() if "application/json" in response.headers.get("content-type", "") else None
+    if response.status_code >= 400:
+        error_message = None
+        if isinstance(payload, dict):
+          error_message = payload.get("error_message")
+        raise HttpError(
+            status=502,
+            code=ERR_FUNCTION_CALL_FAILED,
+            message=f"{function_name} failed: {error_message or response.text}",
+        )
+    if not isinstance(payload, dict):
+        raise HttpError(status=502, code=ERR_FUNCTION_CALL_FAILED, message=f"{function_name} returned invalid payload")
+    return payload
+
+
+async def _process_claimed_generate_run(
+    run_id: UUID,
+    request_id: str,
+    claimed_by: str,
+    attempt_count: int,
+    queue_wait_ms: int | None,
+) -> None:
+    request_start = time.perf_counter()
+    heartbeat_task = asyncio.create_task(_run_generation_claim_heartbeat(run_id, claimed_by))
+    try:
+        bullets_start = time.perf_counter()
+        await _invoke_supabase_function(
+            "generate-bullets",
+            {"run_id": str(run_id), "request_id": request_id},
+        )
+        _log_event(
+            phase="generate_bullets_complete",
+            run_id=run_id,
+            duration_ms=int((time.perf_counter() - bullets_start) * 1000),
+        )
+
+        tailored_start = time.perf_counter()
+        await _invoke_supabase_function(
+            "generate-tailored-resume",
+            {"run_id": str(run_id), "request_id": request_id},
+        )
+        _log_event(
+            phase="generate_tailored_resume_complete",
+            run_id=run_id,
+            duration_ms=int((time.perf_counter() - tailored_start) * 1000),
+        )
+        _log_event(
+            phase="generate_success",
+            run_id=run_id,
+            duration_ms=int((time.perf_counter() - request_start) * 1000),
+            attempt_count=attempt_count,
+            queue_wait_ms=queue_wait_ms,
+        )
+        _log_generation_summary(
+            run_id=run_id,
+            status="success",
+            duration_ms=int((time.perf_counter() - request_start) * 1000),
+            attempt_count=attempt_count,
+            queue_wait_ms=queue_wait_ms,
+        )
+    except Exception as error:
+        error_code = error.code if isinstance(error, HttpError) else ERR_FUNCTION_CALL_FAILED
+        error_message = str(error) if str(error) else "Unknown generation failure"
+        _log_event(
+            phase="generate_error",
+            run_id=run_id,
+            duration_ms=int((time.perf_counter() - request_start) * 1000),
+            error_code=error_code,
+            error_message=error_message,
+            attempt_count=attempt_count,
+            queue_wait_ms=queue_wait_ms,
+        )
+        if attempt_count < GENERATION_WORKER_MAX_ATTEMPTS:
+            await _requeue_generate_run(
+                run_id,
+                claimed_by,
+                error_code,
+                error_message,
+                GENERATION_RETRY_DELAY_SECONDS,
+            )
+        else:
+            await _set_generate_failed(run_id, claimed_by, error_code, error_message)
+        _log_generation_summary(
+            run_id=run_id,
+            status="failed" if attempt_count >= GENERATION_WORKER_MAX_ATTEMPTS else "requeued",
+            duration_ms=int((time.perf_counter() - request_start) * 1000),
+            attempt_count=attempt_count,
+            queue_wait_ms=queue_wait_ms,
+            error_code=error_code,
+        )
+        raise
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+
+async def _claim_next_pdf_run() -> dict[str, Any] | None:
+    rows = await _supabase_fetch(
+        path="rpc/claim_next_pdf_run",
+        method="POST",
+        body={"p_claimed_by": PDF_WORKER_CLAIM_OWNER, "p_lease_seconds": PDF_WORKER_LEASE_SECONDS},
+    )
+    if rows is None:
+        return None
+    if not isinstance(rows, list):
+        raise HttpError(status=500, code=ERR_INVALID_RUN_ROW, message="claim_next_pdf_run returned invalid payload")
+    if not rows:
+        return None
+    row = rows[0]
+    if not isinstance(row, dict):
+        raise HttpError(status=500, code=ERR_INVALID_RUN_ROW, message="claim_next_pdf_run returned invalid row")
+    return row
+
+
+async def _heartbeat_claimed_pdf_run(run_id: UUID, claimed_by: str) -> None:
+    path = (
+        f"resume_runs?id=eq.{run_id}&status=eq.compiling_pdf"
+        f"&pdf_claimed_by=eq.{_encode_rest_eq_value(claimed_by)}"
+    )
+    rows = await _supabase_fetch(
+        path=path,
+        method="PATCH",
+        body={"pdf_heartbeat_at": _utc_now_iso()},
+        prefer="return=representation",
+    )
+    if not isinstance(rows, list) or len(rows) == 0:
+        raise HttpError(
+            status=409,
+            code=ERR_PDF_NOT_CLAIMED,
+            message="Run is not in compiling_pdf state during pdf heartbeat",
+        )
+
+
+async def _run_pdf_claim_heartbeat(run_id: UUID, claimed_by: str) -> None:
+    while True:
+        await asyncio.sleep(PDF_RUN_HEARTBEAT_INTERVAL_SECONDS)
+        await _heartbeat_claimed_pdf_run(run_id, claimed_by)
+
+
+async def _requeue_pdf_run(run_id: UUID, claimed_by: str, code: str, message: str, delay_seconds: float) -> None:
+    retry_at = datetime.now(timezone.utc).timestamp() + max(delay_seconds, 1)
+    path = (
+        f"resume_runs?id=eq.{run_id}&status=eq.compiling_pdf"
+        f"&pdf_claimed_by=eq.{_encode_rest_eq_value(claimed_by)}"
+    )
+    rows = await _supabase_fetch(
+        path=path,
+        method="PATCH",
+        body={
+            "status": "queued_pdf",
+            "error_code": code,
+            "error_message": message[:400],
+            "pdf_claimed_by": None,
+            "pdf_claimed_at": None,
+            "pdf_heartbeat_at": None,
+            "pdf_next_retry_at": datetime.fromtimestamp(retry_at, timezone.utc).isoformat(),
+        },
+        prefer="return=representation",
+    )
+    if not isinstance(rows, list) or len(rows) == 0:
+        raise HttpError(
+            status=409,
+            code=ERR_PDF_NOT_CLAIMED,
+            message="Run is not in compiling_pdf state during pdf retry requeue",
+        )
+
+
+async def _set_pdf_failed(run_id: UUID, claimed_by: str, code: str, message: str) -> None:
+    path = (
+        f"resume_runs?id=eq.{run_id}&status=eq.compiling_pdf"
+        f"&pdf_claimed_by=eq.{_encode_rest_eq_value(claimed_by)}"
+    )
+    rows = await _supabase_fetch(
+        path=path,
+        method="PATCH",
+        body={
+            "status": "failed",
+            "error_code": code,
+            "error_message": message[:400],
+            "pdf_claimed_by": None,
+            "pdf_claimed_at": None,
+            "pdf_heartbeat_at": None,
+            "pdf_next_retry_at": None,
+        },
+        prefer="return=representation",
+    )
+    if not isinstance(rows, list) or len(rows) == 0:
+        raise HttpError(
+            status=409,
+            code=ERR_PDF_NOT_CLAIMED,
+            message="Run is not in compiling_pdf state during pdf failure finalize",
+        )
+
+
+async def _process_claimed_pdf_run(
+    run_id: UUID,
+    attempt_count: int,
+    queue_wait_ms: int | None,
+) -> None:
+    request_start = time.perf_counter()
+    heartbeat_task = asyncio.create_task(_run_pdf_claim_heartbeat(run_id, PDF_WORKER_CLAIM_OWNER))
+    try:
+        compile_start = time.perf_counter()
+        await _invoke_supabase_function(
+            "compile-tailored-resume-pdf",
+            {"run_id": str(run_id)},
+        )
+        _log_event(
+            phase="pdf_compile_complete",
+            run_id=run_id,
+            duration_ms=int((time.perf_counter() - compile_start) * 1000),
+        )
+        _log_event(
+            phase="pdf_success",
+            run_id=run_id,
+            duration_ms=int((time.perf_counter() - request_start) * 1000),
+            attempt_count=attempt_count,
+            queue_wait_ms=queue_wait_ms,
+        )
+        _log_pdf_summary(
+            run_id=run_id,
+            status="success",
+            duration_ms=int((time.perf_counter() - request_start) * 1000),
+            attempt_count=attempt_count,
+            queue_wait_ms=queue_wait_ms,
+        )
+    except Exception as error:
+        error_code = error.code if isinstance(error, HttpError) else ERR_FUNCTION_CALL_FAILED
+        error_message = str(error) if str(error) else "Unknown pdf generation failure"
+        _log_event(
+            phase="pdf_error",
+            run_id=run_id,
+            duration_ms=int((time.perf_counter() - request_start) * 1000),
+            error_code=error_code,
+            error_message=error_message,
+            attempt_count=attempt_count,
+            queue_wait_ms=queue_wait_ms,
+        )
+        if attempt_count < PDF_WORKER_MAX_ATTEMPTS:
+            await _requeue_pdf_run(
+                run_id,
+                PDF_WORKER_CLAIM_OWNER,
+                error_code,
+                error_message,
+                PDF_RETRY_DELAY_SECONDS,
+            )
+        else:
+            await _set_pdf_failed(run_id, PDF_WORKER_CLAIM_OWNER, error_code, error_message)
+        _log_pdf_summary(
+            run_id=run_id,
+            status="failed" if attempt_count >= PDF_WORKER_MAX_ATTEMPTS else "requeued",
+            duration_ms=int((time.perf_counter() - request_start) * 1000),
+            attempt_count=attempt_count,
+            queue_wait_ms=queue_wait_ms,
+            error_code=error_code,
+        )
+        raise
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
 
 
 def _normalize_line(line: str) -> str:
@@ -927,7 +1396,7 @@ async def _process_claimed_run(
         )
 
         finalize_start = time.perf_counter()
-        await _set_run_extracted(run_id, claimed_by)
+        await _set_run_ready_for_generation(run_id, claimed_by)
         _log_event(
             phase="finalize_complete",
             run_id=run_id,
@@ -1085,6 +1554,79 @@ async def _run_worker_once() -> bool:
     return True
 
 
+async def _run_generation_worker_once() -> bool:
+    claim_start = time.perf_counter()
+    row = await _claim_next_generate_run()
+    if row is None:
+        return False
+
+    run_id_raw = row.get("id")
+    request_id = row.get("request_id")
+    attempt_count = row.get("generation_attempt_count")
+    run_updated_at = row.get("updated_at")
+    if not isinstance(run_id_raw, str) or not isinstance(request_id, str) or not isinstance(attempt_count, int):
+        raise HttpError(
+            status=500,
+            code=ERR_INVALID_RUN_ROW,
+            message="Claimed generate run is missing id, request_id, or generation_attempt_count",
+        )
+    run_id = UUID(run_id_raw)
+    queue_wait_ms = _compute_queue_wait_ms(run_updated_at if isinstance(run_updated_at, str) else None)
+
+    _log_event(
+        phase="generate_claim_complete",
+        run_id=run_id,
+        duration_ms=int((time.perf_counter() - claim_start) * 1000),
+        attempt_count=attempt_count,
+        queue_wait_ms=queue_wait_ms,
+    )
+
+    try:
+        await _process_claimed_generate_run(
+            run_id,
+            request_id,
+            GENERATION_WORKER_CLAIM_OWNER,
+            attempt_count,
+            queue_wait_ms,
+        )
+    except HttpError:
+        pass
+    return True
+
+
+async def _run_pdf_worker_once() -> bool:
+    claim_start = time.perf_counter()
+    row = await _claim_next_pdf_run()
+    if row is None:
+        return False
+
+    run_id_raw = row.get("id")
+    attempt_count = row.get("pdf_attempt_count")
+    run_updated_at = row.get("updated_at")
+    if not isinstance(run_id_raw, str) or not isinstance(attempt_count, int):
+        raise HttpError(
+            status=500,
+            code=ERR_INVALID_RUN_ROW,
+            message="Claimed pdf run is missing id or pdf_attempt_count",
+        )
+    run_id = UUID(run_id_raw)
+    queue_wait_ms = _compute_queue_wait_ms(run_updated_at if isinstance(run_updated_at, str) else None)
+
+    _log_event(
+        phase="pdf_claim_complete",
+        run_id=run_id,
+        duration_ms=int((time.perf_counter() - claim_start) * 1000),
+        attempt_count=attempt_count,
+        queue_wait_ms=queue_wait_ms,
+    )
+
+    try:
+        await _process_claimed_pdf_run(run_id, attempt_count, queue_wait_ms)
+    except HttpError:
+        pass
+    return True
+
+
 async def run_worker_forever() -> None:
     wake_event = asyncio.Event()
     realtime_task: asyncio.Task[None] | None = None
@@ -1117,7 +1659,13 @@ async def run_worker_forever() -> None:
                 processed_any = False
                 while True:
                     processed = await _run_worker_once()
-                    if not processed:
+                    generation_processed = False
+                    pdf_processed = False
+                    if GENERATION_WORKER_ENABLED:
+                        generation_processed = await _run_generation_worker_once()
+                    if PDF_WORKER_ENABLED:
+                        pdf_processed = await _run_pdf_worker_once()
+                    if not processed and not generation_processed and not pdf_processed:
                         break
                     processed_any = True
 
@@ -1179,7 +1727,7 @@ def _build_realtime_websocket_url() -> str:
     return urlunparse((scheme, parsed.netloc, "/realtime/v1/websocket", "", query, ""))
 
 
-def _is_resume_runs_queued_change(message: dict[str, Any]) -> bool:
+def _is_resume_runs_queueable_change(message: dict[str, Any]) -> bool:
     if message.get("event") != "postgres_changes":
         return False
     payload = message.get("payload")
@@ -1194,7 +1742,7 @@ def _is_resume_runs_queued_change(message: dict[str, Any]) -> bool:
     record = data.get("record")
     if not isinstance(record, dict):
         return False
-    return record.get("status") == "queued"
+    return record.get("status") in {"queued", "queued_generate", "queued_pdf"}
 
 
 async def _run_realtime_wakeup_loop(wake_event: asyncio.Event) -> None:
@@ -1234,6 +1782,30 @@ async def _run_realtime_session(wake_event: asyncio.Event) -> None:
                         "table": "resume_runs",
                         "filter": "status=eq.queued",
                     },
+                    {
+                        "event": "INSERT",
+                        "schema": SUPABASE_DB_SCHEMA,
+                        "table": "resume_runs",
+                        "filter": "status=eq.queued_generate",
+                    },
+                    {
+                        "event": "UPDATE",
+                        "schema": SUPABASE_DB_SCHEMA,
+                        "table": "resume_runs",
+                        "filter": "status=eq.queued_generate",
+                    },
+                    {
+                        "event": "INSERT",
+                        "schema": SUPABASE_DB_SCHEMA,
+                        "table": "resume_runs",
+                        "filter": "status=eq.queued_pdf",
+                    },
+                    {
+                        "event": "UPDATE",
+                        "schema": SUPABASE_DB_SCHEMA,
+                        "table": "resume_runs",
+                        "filter": "status=eq.queued_pdf",
+                    },
                 ],
             },
             "access_token": SUPABASE_SERVICE_ROLE_KEY,
@@ -1268,7 +1840,7 @@ async def _run_realtime_session(wake_event: asyncio.Event) -> None:
                     message = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                if _is_resume_runs_queued_change(message):
+                if _is_resume_runs_queueable_change(message):
                     _log_event(phase="worker_realtime_wakeup")
                     wake_event.set()
         finally:
@@ -1340,4 +1912,4 @@ async def extract(
         run_attempt_count,
         queue_wait_ms,
     )
-    return {"ok": True, "run_id": str(run_id), "status": "extracted"}
+    return {"ok": True, "run_id": str(run_id), "status": "queued_generate"}
