@@ -114,8 +114,7 @@ async def _fetch_run_statuses(client: httpx.AsyncClient, run_ids: list[str]) -> 
             f"?id=in.({ids})"
             "&select=id,status,error_code,created_at,updated_at,"
             "extraction_claimed_by,extraction_claimed_at,extraction_heartbeat_at,extraction_attempt_count,"
-            "generation_claimed_by,generation_claimed_at,generation_heartbeat_at,generation_attempt_count,"
-            "pdf_claimed_by,pdf_claimed_at,pdf_heartbeat_at,pdf_attempt_count"
+            "generation_claimed_by,generation_claimed_at,generation_heartbeat_at,generation_attempt_count"
         ),
         method="GET",
     )
@@ -182,11 +181,8 @@ async def main() -> None:
     peak_extracting_at = 0.0
     peak_generating = 0
     peak_generating_at = 0.0
-    peak_compiling_pdf = 0
-    peak_compiling_pdf_at = 0.0
     extraction_claimed_by_seen: set[str] = set()
     generation_claimed_by_seen: set[str] = set()
-    pdf_claimed_by_seen: set[str] = set()
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         run_ids = await _insert_runs(client, rows)
@@ -198,23 +194,17 @@ async def main() -> None:
             summary = _summarize(status_rows)
             extraction_claimed_by = _claimed_by_counts(status_rows, "extraction_claimed_by")
             generation_claimed_by = _claimed_by_counts(status_rows, "generation_claimed_by")
-            pdf_claimed_by = _claimed_by_counts(status_rows, "pdf_claimed_by")
             extraction_claimed_by_seen.update(extraction_claimed_by)
             generation_claimed_by_seen.update(generation_claimed_by)
-            pdf_claimed_by_seen.update(pdf_claimed_by)
             elapsed = time.monotonic() - started_at
             extracting_now = summary.get("extracting", 0)
             generating_now = summary.get("generating", 0)
-            compiling_pdf_now = summary.get("compiling_pdf", 0)
             if extracting_now > peak_extracting:
                 peak_extracting = extracting_now
                 peak_extracting_at = elapsed
             if generating_now > peak_generating:
                 peak_generating = generating_now
                 peak_generating_at = elapsed
-            if compiling_pdf_now > peak_compiling_pdf:
-                peak_compiling_pdf = compiling_pdf_now
-                peak_compiling_pdf_at = elapsed
             print(
                 json.dumps(
                     {
@@ -222,10 +212,8 @@ async def main() -> None:
                         "status_counts": summary,
                         "extraction_claimed_by_counts": extraction_claimed_by,
                         "generation_claimed_by_counts": generation_claimed_by,
-                        "pdf_claimed_by_counts": pdf_claimed_by,
                         "peak_extracting_so_far": peak_extracting,
                         "peak_generating_so_far": peak_generating,
-                        "peak_compiling_pdf_so_far": peak_compiling_pdf,
                     },
                     sort_keys=True,
                 )
@@ -239,16 +227,12 @@ async def main() -> None:
                     "status_counts": summary,
                     "extraction_claimed_by_counts": extraction_claimed_by,
                     "generation_claimed_by_counts": generation_claimed_by,
-                    "pdf_claimed_by_counts": pdf_claimed_by,
                     "peak_extracting": peak_extracting,
                     "peak_extracting_at_seconds": round(peak_extracting_at, 3),
                     "peak_generating": peak_generating,
                     "peak_generating_at_seconds": round(peak_generating_at, 3),
-                    "peak_compiling_pdf": peak_compiling_pdf,
-                    "peak_compiling_pdf_at_seconds": round(peak_compiling_pdf_at, 3),
                     "distinct_extraction_claimed_by": sorted(extraction_claimed_by_seen),
                     "distinct_generation_claimed_by": sorted(generation_claimed_by_seen),
-                    "distinct_pdf_claimed_by": sorted(pdf_claimed_by_seen),
                     "rows": status_rows,
                 }
                 if args.summary_json:
@@ -272,10 +256,6 @@ async def main() -> None:
                                 "generation_claimed_at",
                                 "generation_heartbeat_at",
                                 "generation_attempt_count",
-                                "pdf_claimed_by",
-                                "pdf_claimed_at",
-                                "pdf_heartbeat_at",
-                                "pdf_attempt_count",
                             ],
                         )
                         writer.writeheader()
@@ -295,10 +275,6 @@ async def main() -> None:
                                     "generation_claimed_at": row.get("generation_claimed_at"),
                                     "generation_heartbeat_at": row.get("generation_heartbeat_at"),
                                     "generation_attempt_count": row.get("generation_attempt_count"),
-                                    "pdf_claimed_by": row.get("pdf_claimed_by"),
-                                    "pdf_claimed_at": row.get("pdf_claimed_at"),
-                                    "pdf_heartbeat_at": row.get("pdf_heartbeat_at"),
-                                    "pdf_attempt_count": row.get("pdf_attempt_count"),
                                 }
                             )
                 return
