@@ -60,6 +60,7 @@ WORKER_REALTIME_HEARTBEAT_SECONDS = float(os.getenv("WORKER_REALTIME_HEARTBEAT_S
 WORKER_REALTIME_RECONNECT_SECONDS = float(os.getenv("WORKER_REALTIME_RECONNECT_SECONDS", "5"))
 WORKER_ATTACH_TO_API = _env_flag("WORKER_ATTACH_TO_API", default=False)
 WORKER_CLAIM_OWNER = os.getenv("WORKER_CLAIM_OWNER", "").strip() or f"worker:{socket.gethostname()}:{os.getpid()}"
+EXTRACTION_WORKER_CONCURRENCY = max(1, int(os.getenv("EXTRACTION_WORKER_CONCURRENCY", "1")))
 API_CLAIM_OWNER = os.getenv("API_CLAIM_OWNER", "").strip() or f"api:{socket.gethostname()}:{os.getpid()}"
 WORKER_LEASE_SECONDS = int(os.getenv("WORKER_LEASE_SECONDS", "120"))
 RUN_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("RUN_HEARTBEAT_INTERVAL_SECONDS", "15"))
@@ -430,12 +431,12 @@ async def _claim_run(run_id: UUID) -> dict[str, Any]:
     return rows[0]
 
 
-async def _claim_next_run() -> dict[str, Any] | None:
+async def _claim_next_run(claimed_by: str) -> dict[str, Any] | None:
     rows = await _supabase_fetch(
         path="rpc/claim_next_resume_run",
         method="POST",
         body={
-            "p_claimed_by": WORKER_CLAIM_OWNER,
+            "p_claimed_by": claimed_by,
             "p_lease_seconds": WORKER_LEASE_SECONDS,
         },
     )
@@ -1509,7 +1510,17 @@ async def _process_claimed_run(
 
 
 async def _run_worker_once() -> bool:
-    claimed = await _claim_next_run()
+    return await _run_worker_slot_once(WORKER_CLAIM_OWNER)
+
+
+def _build_extraction_claim_owner(slot_index: int) -> str:
+    if slot_index <= 0:
+        return WORKER_CLAIM_OWNER
+    return f"{WORKER_CLAIM_OWNER}:{slot_index + 1}"
+
+
+async def _run_worker_slot_once(claimed_by: str) -> bool:
+    claimed = await _claim_next_run(claimed_by)
     if claimed is None:
         return False
 
@@ -1536,6 +1547,7 @@ async def _run_worker_once() -> bool:
     _log_event(
         phase="worker_claimed",
         run_id=run_id,
+        claimed_by=claimed_by,
         attempt_count=run_attempt_count_raw,
         queue_wait_ms=queue_wait_ms,
     )
@@ -1544,7 +1556,7 @@ async def _run_worker_once() -> bool:
             run_id,
             run_user_id_raw,
             run_resume_path,
-            WORKER_CLAIM_OWNER,
+            claimed_by,
             run_attempt_count_raw,
             queue_wait_ms,
         )
@@ -1643,6 +1655,7 @@ async def run_worker_forever() -> None:
     _log_event(
         phase="worker_start",
         worker_id=WORKER_CLAIM_OWNER,
+        extraction_worker_concurrency=EXTRACTION_WORKER_CONCURRENCY,
         poll_interval_seconds=WORKER_POLL_INTERVAL_SECONDS,
         realtime_enabled=WORKER_REALTIME_ENABLED,
         generation_worker_enabled=GENERATION_WORKER_ENABLED,
@@ -1660,7 +1673,13 @@ async def run_worker_forever() -> None:
             try:
                 processed_any = False
                 while True:
-                    processed = await _run_worker_once()
+                    extraction_results = await asyncio.gather(
+                        *[
+                            _run_worker_slot_once(_build_extraction_claim_owner(slot_index))
+                            for slot_index in range(EXTRACTION_WORKER_CONCURRENCY)
+                        ]
+                    )
+                    processed = any(extraction_results)
                     generation_processed = False
                     pdf_processed = False
                     if GENERATION_WORKER_ENABLED:
