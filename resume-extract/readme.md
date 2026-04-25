@@ -51,9 +51,12 @@ Worker env variables:
 - `WORKER_REALTIME_RECONNECT_SECONDS` (optional, default `5`)
 - `WORKER_ATTACH_TO_API` (optional, default `false`; when `true`, worker starts inside API process)
 - `WEB_CONCURRENCY` (optional, Docker default `2`; each API process runs one attached worker when `WORKER_ATTACH_TO_API=true`)
+- `GENERATION_WORKER_ENABLED` (optional, default `false`; set to `true` only if this service should also claim generation work)
+- `PDF_WORKER_ENABLED` (optional, default `false`; set to `true` only if this service should also claim PDF compilation work)
 
 Render note:
 - The provided Docker image sets `WORKER_ATTACH_TO_API=true` and `WEB_CONCURRENCY=2`, so a single Render web service runs both the API and two attached worker processes by default.
+- Attached workers are extraction-only by default so `WEB_CONCURRENCY` maps more directly to extraction capacity.
 - If you split API and worker into separate services, override `WORKER_ATTACH_TO_API=false` on the web service and run `python -m src.worker` in the worker service.
 
 ## Deploy Worker (systemd)
@@ -82,6 +85,7 @@ Important:
 - The worker uses service-role credentials and atomically claims queued runs in Postgres (`claim_next_resume_run()`), so multiple workers can run safely without double-processing.
 - Update `User`, `Group`, `WorkingDirectory`, and `ExecStart` in the unit file for your server paths.
 - If `WORKER_ATTACH_TO_API=true`, each API process will run a worker. Keep API process count in mind for desired worker concurrency.
+- Leave `GENERATION_WORKER_ENABLED=false` and `PDF_WORKER_ENABLED=false` on the extraction service if generation and PDF are handled elsewhere. Otherwise attached extraction workers will spend capacity on downstream stages.
 - Multiple API processes increase memory and CPU usage. Start with `WEB_CONCURRENCY=2` and raise it only if the instance has headroom.
 
 ## Test
